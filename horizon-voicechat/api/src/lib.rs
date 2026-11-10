@@ -24,12 +24,12 @@ mod util;
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;
 use std::sync::{Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use horizon_client::mod_api::{
     ClientDisconnectingEvent, ClientPacketEvent, ClientPlayerNetworkLoggingInEvent,
-    ClientStoppingEvent, ClientTickPreEvent, ClientboundPlayPacket, Hooks, Host, KeyEvent,
-    ServerboundPlayPacket,
+    ClientStoppingEvent, ClientTickPreEvent, ClientboundPlayPacket, GuiRenderPostEvent, Hooks, Host,
+    KeyEvent, ServerboundPlayPacket,
 };
 use net::session::{Event, UdpClient};
 use net::tcp::{self, channel, PlayerState, Secret};
@@ -39,6 +39,16 @@ use net::udp::Packet;
 const PUSH_TO_TALK: &str = "key.keyboard.v";
 /// Press to mute or unmute the microphone.
 const MUTE: &str = "key.keyboard.m";
+
+/// How long a speaker stays in the indicator after the last voice frame (an end marker normally
+/// clears them at once; this is only for a lost one).
+const SPEAKING_TIMEOUT: Duration = Duration::from_secs(2);
+
+const COLOR_GREEN: u32 = 0x55FF55;
+const COLOR_YELLOW: u32 = 0xFFFF55;
+const COLOR_RED: u32 = 0xFF5555;
+const COLOR_AQUA: u32 = 0x55FFFF;
+const COLOR_GRAY: u32 = 0xAAAAAA;
 
 pub fn hooks() -> Box<dyn Hooks> {
     Box::new(VoiceChat { inner: Mutex::new(Inner::default()) })
@@ -86,6 +96,8 @@ struct Inner {
     mic: Option<audio::Mic>,
     /// Every player's voice state the server told us about, by UUID.
     players: HashMap<[u8; 16], PlayerState>,
+    /// When each speaker's voice was last heard, for the on-screen indicator.
+    speaking: HashMap<[u8; 16], Instant>,
     push_to_talk: bool,
     muted: bool,
     /// We are in the middle of a transmission, so the end marker is still owed.
@@ -107,6 +119,44 @@ impl Inner {
         let muted = self.muted;
         *self = Inner::default();
         self.muted = muted;
+    }
+
+    /// The lines of the on-screen voice indicator, with their text colour. Empty when the
+    /// server has no voice chat (or before it answers).
+    fn indicator_lines(&self) -> Vec<(String, u32)> {
+        if self.udp.is_none() && self.resolving.is_none() {
+            return Vec::new();
+        }
+        let mut lines = Vec::new();
+        match &self.udp {
+            Some(udp) if udp.is_connected() => {
+                lines.push(("Voice chat: connected".to_owned(), COLOR_GREEN));
+            }
+            _ => lines.push(("Voice chat: connecting".to_owned(), COLOR_YELLOW)),
+        }
+        if self.muted {
+            lines.push(("Microphone: muted (M)".to_owned(), COLOR_RED));
+        } else if self.push_to_talk {
+            lines.push(("Microphone: talking (V)".to_owned(), COLOR_AQUA));
+        } else {
+            lines.push(("Hold V to talk, M to mute".to_owned(), COLOR_GRAY));
+        }
+        let mut names: Vec<&str> = self
+            .speaking
+            .keys()
+            .filter_map(|id| self.players.get(id))
+            .map(|p| p.name.as_str())
+            .collect();
+        names.sort_unstable();
+        if !names.is_empty() {
+            lines.push((format!("Speaking: {}", names.join(", ")), COLOR_GREEN));
+        }
+        lines
+    }
+
+    /// Drops speakers whose end marker never arrived.
+    fn prune_speaking(&mut self, now: Instant) {
+        self.speaking.retain(|_, heard| now.duration_since(*heard) < SPEAKING_TIMEOUT);
     }
 
     fn handle_message(&mut self, channel_name: &str, data: &[u8]) {
@@ -201,6 +251,7 @@ impl Inner {
         }
         self.poll_resolving();
         self.poll_udp();
+        self.prune_speaking(Instant::now());
         self.transmit();
         if let Some(audio) = &self.audio {
             audio.collect_finished();
@@ -234,6 +285,11 @@ impl Inner {
                 Event::TimedOut => log("voice chat: the server stopped answering"),
                 Event::Received(Packet::PlayerSound { first_id, opus, sequence, .. })
                 | Event::Received(Packet::GroupSound { first_id, opus, sequence, .. }) => {
+                    if opus.is_empty() {
+                        self.speaking.remove(&first_id.0);
+                    } else {
+                        self.speaking.insert(first_id.0, Instant::now());
+                    }
                     if let Some(audio) = &self.audio {
                         audio.play(first_id.0, &opus, sequence);
                     }
@@ -323,6 +379,30 @@ impl Hooks for VoiceChat {
         }
     }
 
+    /// A small panel in the lower left with the voice connection, the microphone and who is
+    /// speaking. `gui_render_post` keeps it above screens and menus (API 410); it follows F1.
+    fn gui_render_post(&self, host: &dyn Host, event: &mut GuiRenderPostEvent<'_>) {
+        if event.gui_hidden || !host.playing() {
+            return;
+        }
+        let state = self.state();
+        let lines = state.indicator_lines();
+        if lines.is_empty() {
+            return;
+        }
+        const PAD: f32 = 4.0;
+        const LINE: f32 = 10.0;
+        let width =
+            lines.iter().map(|(text, _)| host.text_width(text)).fold(0.0_f32, f32::max) + PAD * 2.0;
+        let height = lines.len() as f32 * LINE + PAD * 2.0;
+        let x = 6.0;
+        let y = (event.batch.height - height - 6.0).max(4.0);
+        host.fill(event.batch, [x, y, width, height], 0x80000000);
+        for (i, (text, color)) in lines.iter().enumerate() {
+            host.text(event.batch, text, [x + PAD, y + PAD + i as f32 * LINE], *color, true);
+        }
+    }
+
     fn client_disconnecting(&self, _host: &dyn Host, _: &mut ClientDisconnectingEvent) {
         self.state().reset();
     }
@@ -395,5 +475,58 @@ mod tests {
         assert!(inner.udp.is_some());
         inner.reset();
         assert!(inner.udp.is_none() && inner.server_host.is_none() && inner.muted);
+    }
+
+    fn fake_secret() -> Secret {
+        Secret {
+            secret: net::Uuid([0x11; 16]),
+            server_port: 24454,
+            player: net::Uuid([0x22; 16]),
+            codec: 0,
+            mtu_size: 1275,
+            voice_distance: 48.0,
+            keep_alive_ms: 1000,
+            groups_enabled: true,
+            voice_host: String::new(),
+            allow_recording: true,
+        }
+    }
+
+    #[test]
+    fn the_indicator_shows_the_microphone_and_who_is_speaking() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut inner = Inner {
+            resolving: Some(Resolving {
+                secret: fake_secret(),
+                target: "127.0.0.1:24454".into(),
+                result: rx,
+            }),
+            muted: true,
+            ..Inner::default()
+        };
+        let ana = net::Uuid([1; 16]);
+        inner.players.insert(
+            ana.0,
+            PlayerState {
+                disabled: false,
+                disconnected: false,
+                player: ana,
+                name: "Ana".into(),
+                group: None,
+            },
+        );
+        inner.speaking.insert(ana.0, Instant::now());
+        let lines: Vec<String> = inner.indicator_lines().into_iter().map(|(t, _)| t).collect();
+        assert_eq!(lines[0], "Voice chat: connecting");
+        assert!(lines.contains(&"Microphone: muted (M)".to_owned()));
+        assert!(lines.iter().any(|line| line == "Speaking: Ana"));
+    }
+
+    #[test]
+    fn a_lost_end_marker_stops_showing_a_speaker() {
+        let mut inner = Inner::default();
+        inner.speaking.insert([1; 16], Instant::now() - Duration::from_secs(5));
+        inner.prune_speaking(Instant::now());
+        assert!(inner.speaking.is_empty());
     }
 }

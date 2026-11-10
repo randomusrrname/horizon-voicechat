@@ -1,0 +1,14 @@
+# Simple Voice Chat for Horizon: a native trait mod (docs/native-mods.md, "Trait mods").
+# Build it with
+#   horizon-launcher native-build <this folder> --instance <instance> --trust-native-code
+[mod]
+id = "voicechat"
+version = "0.1.0"
+
+# The Horizon commit it is made for; unpinned, it builds on the instance's own.
+# The code was written against 2ebf00a0281c592f79191e76fce0e7d522c6f425 (2026-11-07).
+[compatibility]
+horizon_revision = "2ebf00a0281c592f79191e76fce0e7d522c6f425"
+
+[api]
+path = "api"

@@ -1,0 +1,9 @@
+[package]
+name = "horizon-voicechat-net"
+version = "0.1.0"
+edition = "2021"
+description = "Client-side network core for Simple Voice Chat compatibility (compat version 20), for a Horizon native mod"
+rust-version = "1.70"
+
+[dependencies]
+ring = "0.17"

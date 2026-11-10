@@ -4,28 +4,21 @@ Voice chat for Horizon on servers that run the Simple Voice Chat plugin or mod (
 It is a clean-room implementation of the network protocol, written from captured traffic; none of
 Simple Voice Chat's code is used. See `../horizon-voicechat-net` for the protocol notes.
 
-## Status: written, never run in Horizon
+## Status: built against the real Horizon, not yet run on a server
 
-Nothing here has been built against the real Horizon. What was checked:
+What was checked:
 
-- The network core (`api/src/net`, copied from `horizon-voicechat-net`): 30 tests on real captured
-  packets pass (with a stand-in for `ring`).
-- The mod glue and audio code compile and their tests pass against stand-ins for `horizon-client`,
-  `cpal` and `rusty-opus` written from the repo's tests, `docs/native-mods.md` and docs.rs. That
-  catches mistakes of my own, not differences with the real APIs.
+- The mod compiles with `horizon-launcher native-build` against Horizon
+  `2ebf00a0281c592f79191e76fce0e7d522c6f425` (the revision pinned in `horizon-mixin.toml`), with
+  the real `horizon-client` mod API, `cpal` 0.16 and `rusty-opus` 1.0.2 from Horizon's lock file.
+- The network core (`api/src/net`, copied from `horizon-voicechat-net`): all 30 tests on real
+  captured packets pass with the real `ring`.
+- The mod has **not** been run against a real Simple Voice Chat server yet, so the handshake and
+  audio path are still unverified end to end.
 
-Likely first problems when you build it, in the order I would check them:
-
-1. Names and signatures of the hook API in `api/src/lib.rs`, guessed from `crates/horizon-client/tests/mod_api_hooks.rs`:
-   `ClientPlayerNetworkLoggingInEvent`, `ClientDisconnectingEvent`, `ClientStoppingEvent`,
-   `ClientTickPreEvent`, `Host::client_state`, `Host::playing`, `Host::send_packet`, and whether the
-   two `&self` hooks take `&dyn Host`.
-2. `rusty-opus` constructor argument types (`OpusEncoder::new(rate, channels, Application)`,
-   `OpusDecoder::new(rate, channels)`) and the public `bitrate_bps` field.
-3. `cpal` 0.16 details in `api/src/audio.rs` (stream configs and sample formats).
-4. `CUSTOM_PAYLOAD_ID = 22` in `api/src/util.rs` (serverbound play `CustomPayload` at Horizon
-   2ebf00a). `send_payload` checks the decoded packet really is a `CustomPayload`, so a wrong id
-   prints an error instead of sending garbage.
+`CUSTOM_PAYLOAD_ID = 22` in `api/src/util.rs` is the serverbound play `CustomPayload` id at that
+commit. `send_payload` checks the decoded packet really is a `CustomPayload`, so a wrong id prints
+an error instead of sending garbage.
 
 ## Build and try
 

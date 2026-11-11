@@ -37,9 +37,24 @@ Fecha: 2026-11-11. Implementación limpia (clean-room) del protocolo de Simple V
 - Ensordecer con `N`: es **local**, omite la reproducción de los demás, pero la sesión UDP sigue
   viva y el micrófono no cambia. Se conserva al reconectar.
 - Objetivo de susurro con `H`: recorre los jugadores listados por nombre y luego vuelve a ninguno.
-- El indicador muestra `Audio: deafened` y `Whisper: <nombre> (not sent yet)`.
+- El HUD muestra la línea `Whisper` con el nombre; el menú, la pestaña Players.
 - **No se envía nada de susurro ni de ensordecido**: sus formatos de red no están capturados.
   El micrófono sigue saliendo como voz normal de proximidad/grupo.
+
+### Paso 5 — GUI estilo Plasmo Voice
+- Módulo `api/src/ui.rs`: todo el dibujo en un solo sitio. Paneles oscuros translúcidos con borde y
+  franja violeta (`0xFF8B5CF6`), cabecera, pestañas, filas con hover y selección. Solo rectángulos
+  rellenos y la fuente del juego: sin texturas ni recursos copiados.
+- HUD: puntos de estado, medidor de micrófono de ocho segmentos con el pico real de los frames
+  (`frame_level`), grupo, ensordecido, susurro y hablantes con punto verde.
+- Menú: cabecera con estado, pestañas **Groups**/**Players** con contadores, filas que reaccionan al
+  puntero, formulario de crear grupo con cursor parpadeante y línea de avisos/pie.
+- `Tab` cambia de página. En **Players** se puede hacer clic en un jugador para fijarlo como objetivo
+  de susurro (local, no se envía). Escribir/Enter solo actúan en **Groups**.
+- El estado se resuelve en `hud_view()`, `status()`, `mic_state()` y `menu_players()`; el dibujo no
+  lee la sesión. `menu_layout()` lo usan tanto el dibujo como los clics, así no se desalinean.
+- **37/37** tests propios contra el `horizon-client` real.
+- Commit: `Step 5: Plasmo-style GUI (tabs, rows, live mic meter, player whisper pick)`.
 
 ## Cómo compilar y probar
 
@@ -48,20 +63,30 @@ horizon-launcher.exe native-build "C:\Users\Mauro\Documents\Horizon Voicechat\ho
   --instance horizon --version nightly-2026-11-07-2ebf00a --trust-native-code
 ```
 
-Última compilación verificada: `native-2ebf00a-77c0cecc2973`, seleccionada para la instancia
-`horizon` (compilación incremental de 8 min 11 s). Commits: `cd7a480` (paso 1), `c951b37`
+Última compilación verificada: `native-2ebf00a-a29fba3121ff`, seleccionada para la instancia
+`horizon` (compilación incremental de 7 min 33 s). Commits: `cd7a480` (paso 1), `c951b37`
 (paso 2), `c4609fc` (paso 3), `86af919` (paso 4).
 
 El `--version nightly-2026-11-07-2ebf00a` es necesario en este entorno: sin él el launcher basa la
 compilación en `c9d474d` en vez del commit fijado.
 
 Teclas: `V` mantener para hablar, `M` mudo, `N` ensordecer, `H` objetivo de susurro, `G` menú de
-grupos. El puerto UDP del servidor (24454 por defecto) debe ser alcanzable.
+grupos; dentro del menú, `Tab` cambia Groups/Players y clic en un jugador lo pone como objetivo de
+susurro. El puerto UDP del servidor (24454 por defecto) debe ser alcanzable.
 
 Tests:
 - `cargo test` en `horizon-voicechat-net` (30 tests).
 - Tests del mod: se ejecutan contra la copia preparada por el launcher en
-  `%APPDATA%\horizon-launcher\native\stage\native-api\voicechat` (33 tests).
+  `%APPDATA%\horizon-launcher\native\stage\native-api\voicechat` (37 tests).
+
+### Paquete `.hnmod`
+- `hnmod/compatibility.json` (juego 26.3, hooks 411, Horizon `2ebf00a…`, mixins `e8cd0aa…`) y
+  `hnmod/package.ps1`, que arma el árbol del registro en una carpeta temporal y llama a su
+  `native.py package` (solo escribe el zip: no compila ni ejecuta nada).
+- Generado: `voicechat-0.1.0.hnmod`, 39 276 bytes, sha256
+  `e890fccd58f8c863ad886a6d40ae36cb32d211658362ecaa580a905d15990a28`. Contiene
+  `horizon-native.json`, `horizon-mixin.toml` y todo `api/src` (incluido `ui.rs`).
+- Sin `LICENSE` en el proyecto, el zip no lleva licencia: hay que elegirla antes de publicar.
 
 ## No verificado
 
@@ -83,5 +108,7 @@ Tests:
 2. Audio posicional (posición de los hablantes + mezcla estéreo).
 3. Hilo propio para el socket UDP y el micrófono (hoy los frames salen en ráfagas cada 50 ms).
 4. Teclas y volumen configurables.
-5. Elegir licencia, coordinar con el issue #7759 de Horizon y pedir permiso/crédito al autor de
-   Simple Voice Chat antes de publicar.
+5. Elegir licencia (y añadirla a la raíz para que el `.hnmod` la lleve), coordinar con el issue
+   #7759 de Horizon y pedir permiso/crédito al autor de Simple Voice Chat antes de publicar.
+6. Publicar en el registro: hace falta que el launcher y `cargo-horizon-mod` de Horizon acepten
+   mods nativos del registro, y revisar el `.hnmod` con el equipo de horizon-mods.

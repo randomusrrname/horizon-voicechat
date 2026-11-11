@@ -22,6 +22,7 @@ mod audio;
 // The protocol core; categories and removals are kept for when a capture confirms them.
 #[allow(dead_code)]
 mod net;
+mod ui;
 mod util;
 
 use std::collections::HashMap;
@@ -38,6 +39,7 @@ use horizon_client::mod_api::{
 use net::session::{Event, UdpClient};
 use net::tcp::{self, channel, Group, JoinedGroup, PlayerState, Secret};
 use net::udp::Packet;
+use ui::{GroupRow, HudView, MenuTab, MenuView, MicState, PlayerRow, Status};
 
 /// Hold to talk (vanilla key names, as `Hooks::key` gets them).
 const PUSH_TO_TALK: &str = "key.keyboard.v";
@@ -49,13 +51,13 @@ const GROUPS: &str = "key.keyboard.g";
 const DEAFEN: &str = "key.keyboard.n";
 /// Press to pick the next whisper target (or none). No whisper packet is sent yet.
 const WHISPER: &str = "key.keyboard.h";
-const ENTER: &str = "key.keyboard.enter";
-const BACKSPACE: &str = "key.keyboard.backspace";
-
-/// How many group rows the menu draws before telling the player the rest are hidden.
-const MAX_GROUP_ROWS: usize = 10;
+/// How many rows the menu draws before telling the player the rest are hidden.
+const MAX_GROUP_ROWS: usize = ui::MAX_ROWS;
 /// Longest group name the text field accepts.
 const MAX_GROUP_NAME: usize = 32;
+const ENTER: &str = "key.keyboard.enter";
+const BACKSPACE: &str = "key.keyboard.backspace";
+const TAB: &str = "key.keyboard.tab";
 
 /// The mod screen id (API 111) the group menu opens.
 const MENU_SCREEN: &str = "voicechat";
@@ -63,12 +65,6 @@ const MENU_SCREEN: &str = "voicechat";
 /// How long a speaker stays in the indicator after the last voice frame (an end marker normally
 /// clears them at once; this is only for a lost one).
 const SPEAKING_TIMEOUT: Duration = Duration::from_secs(2);
-
-const COLOR_GREEN: u32 = 0x55FF55;
-const COLOR_YELLOW: u32 = 0xFFFF55;
-const COLOR_RED: u32 = 0xFF5555;
-const COLOR_AQUA: u32 = 0x55FFFF;
-const COLOR_GRAY: u32 = 0xAAAAAA;
 
 pub fn hooks() -> Box<dyn Hooks> {
     Box::new(VoiceChat { inner: Mutex::new(Inner::default()) })
@@ -130,16 +126,22 @@ struct Inner {
     own_id: Option<[u8; 16]>,
     /// The group name being typed in the menu.
     group_name: String,
+    /// Which page the menu shows.
+    menu_tab: MenuTab,
     /// The last thing the menu said, e.g. why a join did nothing.
     menu_note: Option<String>,
     /// A group name the menu asked to create, sent on the next tick.
     pending_create: Option<String>,
+    /// Ticks since the menu opened, for the text caret's blink.
+    menu_ticks: u32,
     /// An unknown group-related payload was already reported in the log.
     unverified_logged: bool,
     /// When each speaker's voice was last heard, for the on-screen indicator.
     speaking: HashMap<[u8; 16], Instant>,
     push_to_talk: bool,
     muted: bool,
+    /// Peak microphone level of the last frames, 0.0 to 1.0, for the HUD meter.
+    mic_level: f32,
     /// Deafened: other players' voice is decoded but not played. Local only, never sent.
     deafened: bool,
     /// The player a whisper is meant for, if any. Only shown: the whisper packet is unknown.
@@ -157,18 +159,14 @@ struct Resolving {
     result: std::sync::mpsc::Receiver<Option<std::net::SocketAddr>>,
 }
 
-/// Where the group menu draws its parts, in GUI pixels.
-struct MenuLayout {
-    panel: [f32; 4],
-    name: [f32; 4],
-    create: [f32; 4],
-    rows: Vec<[f32; 4]>,
-}
-
-/// Whether `point` is inside `rect` (`[x, y, width, height]`).
-fn inside(rect: [f32; 4], point: [f32; 2]) -> bool {
-    let [x, y, w, h] = rect;
-    point[0] >= x && point[0] <= x + w && point[1] >= y && point[1] <= y + h
+/// The peak of one 20 ms microphone frame as a 0.0 to 1.0 bar value. A voip frame peaks around
+/// -20 dBFS, so amplify it into something the eye can follow.
+fn frame_level(frame: &[f32]) -> f32 {
+    if frame.is_empty() {
+        return 0.0;
+    }
+    let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
+    (rms * 4.0).clamp(0.0, 1.0)
 }
 
 impl Inner {
@@ -218,46 +216,51 @@ impl Inner {
         self.whisper.and_then(|id| self.players.get(&id)).map(|p| p.name.as_str())
     }
 
-    /// The lines of the on-screen voice indicator, with their text colour. Empty when the
-    /// server has no voice chat (or before it answers).
-    fn indicator_lines(&self) -> Vec<(String, u32)> {
-        if self.udp.is_none() && self.resolving.is_none() {
-            return Vec::new();
-        }
-        let mut lines = Vec::new();
+    /// The connection state the HUD and the menu show.
+    fn status(&self) -> Status {
         match &self.udp {
-            Some(udp) if udp.is_connected() => {
-                lines.push(("Voice chat: connected".to_owned(), COLOR_GREEN));
-            }
-            _ => lines.push(("Voice chat: connecting".to_owned(), COLOR_YELLOW)),
+            Some(udp) if udp.is_connected() => Status::Connected,
+            Some(_) => Status::Connecting,
+            None if self.resolving.is_some() => Status::Connecting,
+            None => Status::Offline,
         }
-        if let Some(group) = self.own_group.and_then(|id| self.groups.get(&id)) {
-            lines.push((format!("Group: {}", group.name), COLOR_AQUA));
-        }
+    }
+
+    /// The microphone state: muted wins over talking, and no input device is its own state.
+    fn mic_state(&self) -> MicState {
         if self.muted {
-            lines.push(("Microphone: muted (M)".to_owned(), COLOR_RED));
+            MicState::Muted
+        } else if self.audio.as_ref().is_some_and(|audio| !audio.has_input()) {
+            MicState::Absent
         } else if self.push_to_talk {
-            lines.push(("Microphone: talking (V)".to_owned(), COLOR_AQUA));
+            MicState::Talking
         } else {
-            lines.push(("V talk, M mute, N deafen, H whisper, G groups".to_owned(), COLOR_GRAY));
+            MicState::Idle
         }
-        if self.deafened {
-            lines.push(("Audio: deafened (N), you hear nobody".to_owned(), COLOR_RED));
+    }
+
+    /// Everything the HUD draws. `None` when the server has no voice chat (or before it answers).
+    fn hud_view(&self) -> Option<HudView<'_>> {
+        if self.udp.is_none() && self.resolving.is_none() {
+            return None;
         }
-        if let Some(name) = self.whisper_name() {
-            lines.push((format!("Whisper: {name} (not sent yet)"), COLOR_YELLOW));
-        }
-        let mut names: Vec<&str> = self
+        let mut speaking: Vec<&str> = self
             .speaking
             .keys()
+            .filter(|id| Some(**id) != self.own_id)
             .filter_map(|id| self.players.get(id))
             .map(|p| p.name.as_str())
             .collect();
-        names.sort_unstable();
-        if !names.is_empty() {
-            lines.push((format!("Speaking: {}", names.join(", ")), COLOR_GREEN));
-        }
-        lines
+        speaking.sort_unstable();
+        Some(HudView {
+            status: self.status(),
+            mic: self.mic_state(),
+            level: self.mic_level,
+            group: self.own_group.and_then(|id| self.groups.get(&id)).map(|g| g.name.as_str()),
+            deafened: self.deafened,
+            whisper: self.whisper_name(),
+            speaking,
+        })
     }
 
     /// Drops speakers whose end marker never arrived.
@@ -342,40 +345,26 @@ impl Inner {
         groups
     }
 
-    /// Where the group menu draws each part for a window of `width` x `height` GUI pixels. The
+    /// The players the menu lists, by name, with ourselves first so "you" is easy to find.
+    fn menu_players(&self) -> Vec<&PlayerState> {
+        let mut players: Vec<&PlayerState> = self.players.values().collect();
+        players.sort_by(|a, b| {
+            let own = |p: &PlayerState| Some(p.player.0) != self.own_id;
+            own(a).cmp(&own(b)).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        players
+    }
+
+    /// Where the menu draws each part for a window of `width` x `height` GUI pixels. The
     /// drawing and the click handling both go through this, so they cannot drift apart.
-    fn menu_layout(&self, width: f32, height: f32) -> MenuLayout {
-        const W: f32 = 260.0;
-        const PAD: f32 = 8.0;
-        const LINE: f32 = 12.0;
-        const ROW: f32 = 13.0;
-        const FIELD: f32 = 14.0;
-        const GAP: f32 = 8.0;
-        let rows = self.menu_groups().len().min(MAX_GROUP_ROWS);
-        let h = PAD * 2.0
-            + LINE * 2.0
-            + rows as f32 * ROW
-            + 4.0
-            + FIELD
-            + GAP
-            + FIELD
-            + GAP
-            + LINE * 2.0;
-        let x = ((width - W) * 0.5).max(4.0);
-        let y = ((height - h) * 0.5).max(4.0);
-        let inner_x = x + PAD;
-        let inner_w = W - PAD * 2.0;
-        let mut cursor = y + PAD + LINE * 2.0;
-        let mut row_rects = Vec::with_capacity(rows);
-        for _ in 0..rows {
-            row_rects.push([inner_x, cursor, inner_w, ROW]);
-            cursor += ROW;
-        }
-        cursor += 4.0;
-        let name = [inner_x, cursor, inner_w, FIELD];
-        cursor += FIELD + GAP;
-        let create = [inner_x, cursor, inner_w, FIELD];
-        MenuLayout { panel: [x, y, W, h], name, create, rows: row_rects }
+    fn menu_layout(&self, width: f32, height: f32) -> ui::MenuLayout {
+        ui::menu_layout(self.menu_tab, self.groups.len(), self.players.len(), width, height)
+    }
+
+    /// Switches pages, clearing the last note so it does not look like it belongs to the new one.
+    fn menu_tab_next(&mut self) {
+        self.menu_tab = self.menu_tab.next();
+        self.menu_note = None;
     }
 
     /// Queues the group name for `create_group`, sent on the next tick where the host is mutable.
@@ -400,31 +389,67 @@ impl Inner {
         self.group_name.pop();
     }
 
-    /// A left click on the group menu: rows can only explain why they do nothing yet.
-    fn menu_click(&mut self, layout: &MenuLayout, mouse: [f32; 2]) {
-        if inside(layout.create, mouse) {
-            self.menu_create();
-            return;
-        }
-        if inside(layout.name, mouse) {
-            return;
-        }
-        let groups = self.menu_groups();
-        for (i, row) in layout.rows.iter().enumerate() {
-            if !inside(*row, mouse) {
-                continue;
+    /// A left click on the menu: tabs switch pages, a player becomes the whisper target, and a
+    /// group row can only explain why joining or leaving does nothing yet.
+    fn menu_click(&mut self, layout: &ui::MenuLayout, mouse: [f32; 2]) {
+        for (i, rect) in layout.tabs.iter().enumerate() {
+            if ui::inside(*rect, mouse) {
+                let tab = if i == 0 { MenuTab::Groups } else { MenuTab::Players };
+                if self.menu_tab != tab {
+                    self.menu_tab = tab;
+                    self.menu_note = None;
+                }
+                return;
             }
-            let Some(group) = groups.get(i) else { return };
-            self.menu_note = Some(if Some(group.id.0) == self.own_group {
-                "Leaving needs the leave_group packet, which has not been captured yet.".to_owned()
-            } else {
-                "Joining needs the set_group packet, which has not been captured yet.".to_owned()
-            });
-            return;
+        }
+        match self.menu_tab {
+            MenuTab::Groups => {
+                if ui::inside(layout.create, mouse) {
+                    self.menu_create();
+                    return;
+                }
+                if ui::inside(layout.name, mouse) {
+                    return;
+                }
+                let groups: Vec<[u8; 16]> = self.menu_groups().iter().map(|g| g.id.0).collect();
+                for (i, row) in layout.rows.iter().enumerate() {
+                    if !ui::inside(*row, mouse) {
+                        continue;
+                    }
+                    let Some(id) = groups.get(i) else { return };
+                    self.menu_note = Some(if Some(*id) == self.own_group {
+                        "Leave needs leave_group: not captured yet.".to_owned()
+                    } else {
+                        "Join needs set_group: not captured yet.".to_owned()
+                    });
+                    return;
+                }
+            }
+            MenuTab::Players => {
+                let players: Vec<([u8; 16], String, bool)> = self
+                    .menu_players()
+                    .iter()
+                    .map(|p| (p.player.0, p.name.clone(), Some(p.player.0) == self.own_id))
+                    .collect();
+                for (i, row) in layout.rows.iter().enumerate() {
+                    if !ui::inside(*row, mouse) {
+                        continue;
+                    }
+                    let Some((id, name, own)) = players.get(i) else { return };
+                    if *own {
+                        self.menu_note = Some("That is you.".to_owned());
+                    } else {
+                        self.whisper = Some(*id);
+                        self.menu_note =
+                            Some(format!("Whisper: {name} (local only, not sent yet)."));
+                    }
+                    return;
+                }
+            }
         }
     }
 
-    /// Draws the group menu. `mouse` is the pointer in GUI pixels, for the hover highlight.
+    /// Draws the menu. `mouse` is the pointer in GUI pixels, for the hover highlight.
     fn draw_menu(
         &self,
         host: &dyn Host,
@@ -434,52 +459,39 @@ impl Inner {
         mouse: [f32; 2],
     ) {
         let layout = self.menu_layout(width, height);
-        let [x, y, w, h] = layout.panel;
-        host.fill(batch, [x, y, w, h], 0xE0181818);
-        host.fill(batch, [x, y, w, 1.0], 0xFF55FFFF);
-        host.fill(batch, [x, y + h - 1.0, w, 1.0], 0xFF55FFFF);
-        host.text(batch, "Voice chat groups", [x + 8.0, y + 8.0], COLOR_AQUA, true);
-        let status = match self.own_group.and_then(|id| self.groups.get(&id)) {
-            Some(group) => format!("Your group: {}", group.name),
-            None => "You are not in a group".to_owned(),
+        let groups: Vec<GroupRow<'_>> = self
+            .menu_groups()
+            .iter()
+            .take(MAX_GROUP_ROWS)
+            .map(|g| GroupRow {
+                name: &g.name,
+                password: g.has_password,
+                own: Some(g.id.0) == self.own_group,
+            })
+            .collect();
+        let players: Vec<PlayerRow<'_>> = self
+            .menu_players()
+            .iter()
+            .take(MAX_GROUP_ROWS)
+            .map(|p| PlayerRow {
+                name: &p.name,
+                speaking: self.speaking.contains_key(&p.player.0),
+                own: Some(p.player.0) == self.own_id,
+                whisper: self.whisper == Some(p.player.0),
+            })
+            .collect();
+        let view = MenuView {
+            tab: self.menu_tab,
+            status: self.status(),
+            group_count: self.groups.len(),
+            player_count: self.players.len(),
+            groups,
+            players,
+            group_name: &self.group_name,
+            caret: (self.menu_ticks / 8) % 2 == 0,
+            note: self.menu_note.as_deref(),
         };
-        host.text(batch, &status, [x + 8.0, y + 20.0], COLOR_GRAY, true);
-        let groups = self.menu_groups();
-        for (i, row) in layout.rows.iter().enumerate() {
-            let Some(group) = groups.get(i) else { break };
-            let hovered = inside(*row, mouse);
-            if hovered {
-                host.fill(batch, *row, 0x40FFFFFF);
-            }
-            let mut label = group.name.clone();
-            if group.has_password {
-                label.push_str("  (password)");
-            }
-            let color = if Some(group.id.0) == self.own_group { COLOR_AQUA } else { COLOR_GRAY };
-            host.text(batch, &label, [row[0] + 4.0, row[1] + 2.0], color, true);
-        }
-        host.fill(batch, layout.name, 0x60000000);
-        let typed = format!("New group: {}_", self.group_name);
-        host.text(batch, &typed, [layout.name[0] + 4.0, layout.name[1] + 3.0], COLOR_GRAY, true);
-        host.fill(batch, layout.create, 0x8055FF55);
-        host.text(
-            batch,
-            "Create group",
-            [layout.create[0] + 4.0, layout.create[1] + 3.0],
-            COLOR_GREEN,
-            true,
-        );
-        let note_y = layout.create[1] + layout.create[3] + 6.0;
-        if let Some(note) = &self.menu_note {
-            host.text(batch, note, [x + 8.0, note_y], COLOR_YELLOW, true);
-        }
-        let hidden = groups.len().saturating_sub(MAX_GROUP_ROWS);
-        let footer = if hidden > 0 {
-            format!("{hidden} more groups not shown. Enter creates, Esc closes.")
-        } else {
-            "Enter creates, Esc closes. Join and leave need a capture: disabled.".to_owned()
-        };
-        host.text(batch, &footer, [x + 8.0, note_y + 12.0], COLOR_GRAY, true);
+        ui::draw_menu(host, batch, &view, &layout, mouse);
     }
 
     fn connect(&mut self, secret: &Secret) {
@@ -544,6 +556,7 @@ impl Inner {
     }
 
     fn tick(&mut self) {
+        self.menu_ticks = self.menu_ticks.wrapping_add(1);
         let messages = std::mem::take(&mut self.inbox);
         for (channel_name, data) in messages {
             self.handle_message(&channel_name, &data);
@@ -603,6 +616,8 @@ impl Inner {
 
     /// Sends the microphone while push-to-talk is held, and the end marker when it is let go.
     fn transmit(&mut self) {
+        // The meter follows the loudest recent frame and falls back between them.
+        self.mic_level = (self.mic_level * 0.7).clamp(0.0, 1.0);
         let (Some(udp), Some(audio)) = (self.udp.as_mut(), self.audio.as_ref()) else { return };
         if !udp.is_connected() || !audio.has_input() {
             return;
@@ -610,6 +625,7 @@ impl Inner {
         let transmitting = self.push_to_talk && !self.muted;
         if transmitting {
             while let Some(frame) = audio.take_frame() {
+                self.mic_level = self.mic_level.max(frame_level(&frame));
                 let Some(mic) = self.mic.as_mut() else { break };
                 match mic.encode(&frame) {
                     Ok(opus) => {
@@ -696,6 +712,9 @@ impl Hooks for VoiceChat {
             GROUPS if event.pressed && in_world(host) && host.mod_screen().is_none() => {
                 if host.mod_screen_open(MENU_SCREEN) {
                     state.menu_note = None;
+                    state.menu_tab = MenuTab::Groups;
+                    state.group_name.clear();
+                    state.menu_ticks = 0;
                 }
             }
             DEAFEN if event.pressed && in_world(host) => {
@@ -761,12 +780,22 @@ impl Hooks for VoiceChat {
         match event.key {
             // Escape and the gamepad close the screen; the game does that itself.
             "key.keyboard.escape" => Flow::Continue,
+            TAB if !event.repeat => {
+                self.state().menu_tab_next();
+                Flow::Cancel
+            }
             ENTER if !event.repeat => {
-                self.state().menu_create();
+                let mut state = self.state();
+                if state.menu_tab == MenuTab::Groups {
+                    state.menu_create();
+                }
                 Flow::Cancel
             }
             BACKSPACE => {
-                self.state().menu_backspace();
+                let mut state = self.state();
+                if state.menu_tab == MenuTab::Groups {
+                    state.menu_backspace();
+                }
                 Flow::Cancel
             }
             _ => Flow::Continue,
@@ -781,32 +810,23 @@ impl Hooks for VoiceChat {
         if event.screen.id != "mod" || host.mod_screen() != Some(MENU_SCREEN) {
             return Flow::Continue;
         }
-        self.state().menu_type(event.c);
+        let mut state = self.state();
+        if state.menu_tab == MenuTab::Groups {
+            state.menu_type(event.c);
+        }
         Flow::Cancel
     }
 
-    /// A small panel in the lower left with the voice connection, the microphone and who is
-    /// speaking. `gui_render_post` keeps it above screens and menus (API 410); it follows F1.
+    /// The voice panel in the lower left: connection, a live microphone meter, the group, the
+    /// whisper target and who is speaking. `gui_render_post` keeps it above screens and menus
+    /// (API 410); it follows F1.
     fn gui_render_post(&self, host: &dyn Host, event: &mut GuiRenderPostEvent<'_>) {
         if event.gui_hidden || !host.playing() {
             return;
         }
         let state = self.state();
-        let lines = state.indicator_lines();
-        if lines.is_empty() {
-            return;
-        }
-        const PAD: f32 = 4.0;
-        const LINE: f32 = 10.0;
-        let width =
-            lines.iter().map(|(text, _)| host.text_width(text)).fold(0.0_f32, f32::max) + PAD * 2.0;
-        let height = lines.len() as f32 * LINE + PAD * 2.0;
-        let x = 6.0;
-        let y = (event.batch.height - height - 6.0).max(4.0);
-        host.fill(event.batch, [x, y, width, height], 0x80000000);
-        for (i, (text, color)) in lines.iter().enumerate() {
-            host.text(event.batch, text, [x + PAD, y + PAD + i as f32 * LINE], *color, true);
-        }
+        let Some(view) = state.hud_view() else { return };
+        ui::draw_hud(host, event.batch, &view, event.batch.height);
     }
 
     fn client_disconnecting(&self, _host: &dyn Host, _: &mut ClientDisconnectingEvent) {
@@ -922,10 +942,40 @@ mod tests {
             },
         );
         inner.speaking.insert(ana.0, Instant::now());
-        let lines: Vec<String> = inner.indicator_lines().into_iter().map(|(t, _)| t).collect();
-        assert_eq!(lines[0], "Voice chat: connecting");
-        assert!(lines.contains(&"Microphone: muted (M)".to_owned()));
-        assert!(lines.iter().any(|line| line == "Speaking: Ana"));
+        let view = inner.hud_view().expect("a session starts the HUD");
+        assert_eq!(view.status, Status::Connecting);
+        assert_eq!(view.mic, MicState::Muted);
+        assert_eq!(view.speaking, ["Ana"]);
+    }
+
+    #[test]
+    fn the_hud_never_lists_our_own_voice_as_someone_speaking() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut inner = Inner {
+            resolving: Some(Resolving {
+                secret: fake_secret(),
+                target: "127.0.0.1:24454".into(),
+                result: rx,
+            }),
+            own_id: Some([1; 16]),
+            ..Inner::default()
+        };
+        with_player(&mut inner, [1; 16], "Me");
+        with_player(&mut inner, [2; 16], "Ana");
+        inner.speaking.insert([1; 16], Instant::now());
+        inner.speaking.insert([2; 16], Instant::now());
+        let view = inner.hud_view().unwrap();
+        assert_eq!(view.speaking, ["Ana"]);
+    }
+
+    #[test]
+    fn the_microphone_meter_follows_the_frame_peak() {
+        assert_eq!(frame_level(&[]), 0.0);
+        assert_eq!(frame_level(&[0.0; 960]), 0.0);
+        let quiet = frame_level(&[0.05; 960]);
+        let loud = frame_level(&[0.5; 960]);
+        assert!(quiet > 0.0 && quiet < loud);
+        assert_eq!(loud, 1.0, "a frame at half scale fills the bar");
     }
 
     #[test]
@@ -967,8 +1017,7 @@ mod tests {
         inner.handle_message(channel::STATE, &unhex(STATE_IN_GROUP));
         assert_eq!(inner.own_group, Some(group_id()));
 
-        let lines: Vec<String> = inner.indicator_lines().into_iter().map(|(t, _)| t).collect();
-        assert!(lines.is_empty(), "no UDP session yet: the indicator stays hidden");
+        assert!(inner.hud_view().is_none(), "no UDP session yet: the HUD stays hidden");
 
         inner.handle_message(channel::JOINED_GROUP, &unhex(JOINED_GROUP));
         assert_eq!(inner.own_group, Some(group_id()));
@@ -1129,7 +1178,7 @@ mod tests {
     }
 
     #[test]
-    fn the_indicator_says_when_deafened_or_whispering() {
+    fn the_hud_says_when_deafened_or_whispering() {
         let (_tx, rx) = std::sync::mpsc::channel();
         let mut inner = Inner {
             resolving: Some(Resolving {
@@ -1142,8 +1191,41 @@ mod tests {
         with_player(&mut inner, [0xAA; 16], "Ana");
         inner.deafened = true;
         inner.whisper = Some([0xAA; 16]);
-        let lines: Vec<String> = inner.indicator_lines().into_iter().map(|(t, _)| t).collect();
-        assert!(lines.iter().any(|line| line.starts_with("Audio: deafened")));
-        assert!(lines.iter().any(|line| line == "Whisper: Ana (not sent yet)"));
+        let view = inner.hud_view().unwrap();
+        assert!(view.deafened);
+        assert_eq!(view.whisper, Some("Ana"));
+    }
+
+    #[test]
+    fn clicking_the_tabs_switches_pages_and_a_player_becomes_the_whisper_target() {
+        let mut inner = Inner::default();
+        with_player(&mut inner, [0xAA; 16], "Ana");
+        let layout = inner.menu_layout(1280.0, 720.0);
+        assert!(layout.name[2] > 0.0, "the groups page has the create form");
+
+        let players_tab = layout.tabs[1];
+        inner.menu_click(&layout, [players_tab[0] + 2.0, players_tab[1] + 2.0]);
+        assert_eq!(inner.menu_tab, MenuTab::Players);
+        assert!(inner.menu_note.is_none());
+
+        let layout = inner.menu_layout(1280.0, 720.0);
+        assert_eq!(layout.name, [0.0; 4], "the players page has no create form");
+        let row = layout.rows[0];
+        inner.menu_click(&layout, [row[0] + 2.0, row[1] + 2.0]);
+        assert_eq!(inner.whisper, Some([0xAA; 16]));
+        assert!(inner.menu_note.as_deref().unwrap_or("").contains("Ana"));
+
+        let groups_tab = layout.tabs[0];
+        inner.menu_click(&layout, [groups_tab[0] + 2.0, groups_tab[1] + 2.0]);
+        assert_eq!(inner.menu_tab, MenuTab::Groups);
+    }
+
+    #[test]
+    fn the_players_page_lists_ourselves_first() {
+        let mut inner = Inner { own_id: Some([0xAA; 16]), ..Inner::default() };
+        with_player(&mut inner, [0xBB; 16], "Ana");
+        with_player(&mut inner, [0xAA; 16], "Me");
+        let names: Vec<&str> = inner.menu_players().iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Me", "Ana"]);
     }
 }

@@ -13,6 +13,8 @@ What was checked:
   the real `horizon-client` mod API, `cpal` 0.16 and `rusty-opus` 1.0.2 from Horizon's lock file.
 - The network core (`api/src/net`, copied from `horizon-voicechat-net`): all 30 tests on real
   captured packets pass with the real `ring`.
+- The mod's own 33 unit tests (indicator, group menu, whisper/deafen state) pass against the real
+  `horizon-client` crate with the launcher's toolchain.
 - The mod has **not** been run against a real Simple Voice Chat server yet, so the handshake and
   audio path are still unverified end to end.
 
@@ -28,7 +30,8 @@ horizon-launcher native-build <this folder> --instance <instance> --trust-native
 
 Join a server with Simple Voice Chat (the plugin on Paper, or the mod). Watch the game's standard
 error for lines starting with `[voicechat]`: they say when the secret arrives, when the UDP session
-connects and why anything failed. Hold `V` to talk, press `M` to mute.
+connects and why anything failed. Hold `V` to talk, press `M` to mute, `N` to deafen, `H` to pick
+a whisper target and `G` for the group menu.
 
 On the server side, the UDP port (24454 by default) must be reachable from the client.
 
@@ -45,6 +48,10 @@ On the server side, the UDP port (24454 by default) must be reachable from the c
   microphone state and who is speaking. It follows F1.
 - A group menu of its own (API 111, `G`): lists the server's groups (`add_group`), shows the one
   you are in (`joined_group`, `state`), and creates a group (`create_group`, a captured payload).
+- Deafening (`N`) skips playback locally; nothing is sent, so the server never learns about it.
+- A whisper target picked with `H` (cycles through the listed players, then off). It is shown in
+  the indicator but **not sent**: the whisper packet has never been captured, so voice still goes
+  out as ordinary proximity/group voice.
 
 ## Not done yet
 
@@ -54,7 +61,8 @@ On the server side, the UDP port (24454 by default) must be reachable from the c
   captured, so the menu explains they are disabled instead of sending a guess. The join-with-
   password path and the removal/category payloads (`remove_group`, `add_category`,
   `remove_category`, `remove_state`) are unverified in the same way.
-- Whispers and deafening: the formats are not known yet (no capture has them).
+- Sending whispers and telling the server you are deafened: both formats are unknown (no capture
+  has them). What exists is the local state, the indicator and the deafening itself.
 - Configurable keys and volume.
 - Sending the microphone from the game tick means frames leave in small bursts every 50 ms; a worker
   thread that owns the socket would fix that.

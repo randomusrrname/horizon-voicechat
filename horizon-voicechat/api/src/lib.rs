@@ -14,9 +14,12 @@
 //!    and the UDP session starts (`net::session::UdpClient`). Once connected the audio devices open.
 //! 4. While the push-to-talk key is held, microphone frames are Opus-encoded and sent; other
 //!    players' voice frames are decoded and played.
+//! 5. `G` opens a group menu drawn by the mod itself (API 111); it lists the server's groups and
+//!    creates one. `N` deafens locally and `H` picks a whisper target, both without sending
+//!    anything: those payloads have not been captured.
 
 mod audio;
-// The network core keeps parts the mod does not use yet (groups, the state accessor).
+// The protocol core; categories and removals are kept for when a capture confirms them.
 #[allow(dead_code)]
 mod net;
 mod util;
@@ -29,7 +32,7 @@ use std::time::{Duration, Instant};
 use horizon_client::mod_api::{
     ClientDisconnectingEvent, ClientPacketEvent, ClientPlayerNetworkLoggingInEvent,
     ClientStoppingEvent, ClientTickPreEvent, ClientboundPlayPacket, Flow, GuiRenderPostEvent, Hooks,
-    Host, KeyEvent, ScreenCharTypedPreEvent, ScreenKeyPressedPreEvent,
+    Host, KeyEvent, NativeScreenKind, ScreenCharTypedPreEvent, ScreenKeyPressedPreEvent,
     ScreenMouseButtonPressedPreEvent, ScreenRenderPostEvent, ServerboundPlayPacket,
 };
 use net::session::{Event, UdpClient};
@@ -42,6 +45,10 @@ const PUSH_TO_TALK: &str = "key.keyboard.v";
 const MUTE: &str = "key.keyboard.m";
 /// Press to open or close the group menu.
 const GROUPS: &str = "key.keyboard.g";
+/// Press to stop or resume hearing other players. Local only: nothing is sent.
+const DEAFEN: &str = "key.keyboard.n";
+/// Press to pick the next whisper target (or none). No whisper packet is sent yet.
+const WHISPER: &str = "key.keyboard.h";
 const ENTER: &str = "key.keyboard.enter";
 const BACKSPACE: &str = "key.keyboard.backspace";
 
@@ -69,6 +76,12 @@ pub fn hooks() -> Box<dyn Hooks> {
 
 fn log(message: &str) {
     eprintln!("[voicechat] {message}");
+}
+
+/// The world is being played, with no screen over it (not even chat): where a bare key is a
+/// command rather than typing.
+fn in_world(host: &dyn Host) -> bool {
+    host.client_state().is_some_and(|state| state.screen == NativeScreenKind::Playing)
 }
 
 /// Sends a plugin message to the server (API 409). A mod cannot name the packet's type, so the
@@ -127,6 +140,10 @@ struct Inner {
     speaking: HashMap<[u8; 16], Instant>,
     push_to_talk: bool,
     muted: bool,
+    /// Deafened: other players' voice is decoded but not played. Local only, never sent.
+    deafened: bool,
+    /// The player a whisper is meant for, if any. Only shown: the whisper packet is unknown.
+    whisper: Option<[u8; 16]>,
     /// We are in the middle of a transmission, so the end marker is still owed.
     talking: bool,
     /// The "voice port is closed" notice was already logged for this session.
@@ -157,9 +174,48 @@ fn inside(rect: [f32; 4], point: [f32; 2]) -> bool {
 impl Inner {
     /// Forgets the session: drops the sockets and closes the audio devices.
     fn reset(&mut self) {
-        let muted = self.muted;
+        let (muted, deafened) = (self.muted, self.deafened);
         *self = Inner::default();
         self.muted = muted;
+        self.deafened = deafened;
+    }
+
+    /// Deafens or undeafens. Local: the microphone and the network are untouched.
+    fn toggle_deafen(&mut self) -> bool {
+        self.deafened = !self.deafened;
+        self.deafened
+    }
+
+    /// Picks the next player as the whisper target, and nobody after the last one.
+    fn cycle_whisper(&mut self) -> Option<String> {
+        let mut ids: Vec<[u8; 16]> = self.players.keys().copied().collect();
+        // Whispering at yourself is not a thing.
+        ids.retain(|id| Some(*id) != self.own_id);
+        ids.sort_by(|a, b| {
+            let name = |id: &[u8; 16]| {
+                self.players.get(id).map(|p| p.name.to_lowercase()).unwrap_or_default()
+            };
+            name(a).cmp(&name(b))
+        });
+        if ids.is_empty() {
+            self.whisper = None;
+            return None;
+        }
+        self.whisper = match self.whisper {
+            Some(current) => match ids.iter().position(|id| *id == current) {
+                Some(i) => ids.get(i + 1).copied(),
+                None => ids.first().copied(),
+            },
+            None => ids.first().copied(),
+        };
+        self.whisper
+            .and_then(|id| self.players.get(&id))
+            .map(|player| player.name.clone())
+    }
+
+    /// The name of the whisper target, if the server still lists them.
+    fn whisper_name(&self) -> Option<&str> {
+        self.whisper.and_then(|id| self.players.get(&id)).map(|p| p.name.as_str())
     }
 
     /// The lines of the on-screen voice indicator, with their text colour. Empty when the
@@ -183,7 +239,13 @@ impl Inner {
         } else if self.push_to_talk {
             lines.push(("Microphone: talking (V)".to_owned(), COLOR_AQUA));
         } else {
-            lines.push(("Hold V to talk, M to mute, G for groups".to_owned(), COLOR_GRAY));
+            lines.push(("V talk, M mute, N deafen, H whisper, G groups".to_owned(), COLOR_GRAY));
+        }
+        if self.deafened {
+            lines.push(("Audio: deafened (N), you hear nobody".to_owned(), COLOR_RED));
+        }
+        if let Some(name) = self.whisper_name() {
+            lines.push((format!("Whisper: {name} (not sent yet)"), COLOR_YELLOW));
         }
         let mut names: Vec<&str> = self
             .speaking
@@ -527,8 +589,11 @@ impl Inner {
                     } else {
                         self.speaking.insert(first_id.0, Instant::now());
                     }
-                    if let Some(audio) = &self.audio {
-                        audio.play(first_id.0, &opus, sequence);
+                    // Deafened skips the speakers, not the packets: the session stays alive.
+                    if !self.deafened {
+                        if let Some(audio) = &self.audio {
+                            audio.play(first_id.0, &opus, sequence);
+                        }
                     }
                 }
                 Event::Received(_) => {}
@@ -628,11 +693,27 @@ impl Hooks for VoiceChat {
             }
             // Only from the world: with our screen open the key belongs to its text field, and
             // Escape (or the gamepad) closes that.
-            GROUPS if event.pressed && host.playing() && host.mod_screen().is_none() => {
+            GROUPS if event.pressed && in_world(host) && host.mod_screen().is_none() => {
                 if host.mod_screen_open(MENU_SCREEN) {
                     state.menu_note = None;
                 }
             }
+            DEAFEN if event.pressed && in_world(host) => {
+                let deafened = state.toggle_deafen();
+                log(if deafened {
+                    "deafened: you hear nobody (local only, nothing is sent)"
+                } else {
+                    "no longer deafened"
+                });
+            }
+            // Picks who a whisper would go to. The packet is still unknown, so nothing is sent
+            // and the indicator says so.
+            WHISPER if event.pressed && in_world(host) => match state.cycle_whisper() {
+                Some(name) => log(&format!(
+                    "whisper target: {name} (no whisper packet is sent until a capture confirms it)"
+                )),
+                None => log("whisper target cleared"),
+            },
             _ => {}
         }
     }
@@ -994,5 +1075,75 @@ mod tests {
         inner.handle_message(channel::JOINED_GROUP, &payload);
         assert!(inner.own_group.is_none());
         assert!(inner.menu_note.is_some());
+    }
+
+    fn with_player(inner: &mut Inner, id: [u8; 16], name: &str) {
+        let uuid = net::Uuid(id);
+        inner.players.insert(
+            id,
+            PlayerState {
+                disabled: false,
+                disconnected: false,
+                player: uuid,
+                name: name.into(),
+                group: None,
+            },
+        );
+    }
+
+    #[test]
+    fn deafening_is_local_and_survives_a_reconnect() {
+        let mut inner = Inner::default();
+        assert!(!inner.deafened);
+        assert!(inner.toggle_deafen());
+        inner.deafened = true;
+        inner.reset();
+        assert!(inner.deafened, "the deafen choice is the player's, like mute");
+        assert!(!inner.muted);
+    }
+
+    #[test]
+    fn whisper_cycles_through_players_in_name_order_and_back_to_none() {
+        let mut inner = Inner::default();
+        let ana = net::Uuid([0xAA; 16]);
+        let bob = net::Uuid([0xBB; 16]);
+        with_player(&mut inner, ana.0, "Ana");
+        with_player(&mut inner, bob.0, "Bob");
+
+        assert_eq!(inner.cycle_whisper().as_deref(), Some("Ana"));
+        assert_eq!(inner.whisper_name(), Some("Ana"));
+        assert_eq!(inner.cycle_whisper().as_deref(), Some("Bob"));
+        assert_eq!(inner.cycle_whisper(), None);
+        assert_eq!(inner.whisper, None);
+
+        // A target who leaves is shown as unknown, and the next press starts over.
+        assert_eq!(inner.cycle_whisper().as_deref(), Some("Ana"));
+        inner.players.remove(&ana.0);
+        assert_eq!(inner.whisper_name(), None);
+        assert_eq!(inner.cycle_whisper().as_deref(), Some("Bob"));
+
+        // Our own entry in the player list is never a whisper target.
+        inner.whisper = None;
+        inner.own_id = Some(bob.0);
+        assert_eq!(inner.cycle_whisper(), None, "only our own player is left");
+    }
+
+    #[test]
+    fn the_indicator_says_when_deafened_or_whispering() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut inner = Inner {
+            resolving: Some(Resolving {
+                secret: fake_secret(),
+                target: "127.0.0.1:24454".into(),
+                result: rx,
+            }),
+            ..Inner::default()
+        };
+        with_player(&mut inner, [0xAA; 16], "Ana");
+        inner.deafened = true;
+        inner.whisper = Some([0xAA; 16]);
+        let lines: Vec<String> = inner.indicator_lines().into_iter().map(|(t, _)| t).collect();
+        assert!(lines.iter().any(|line| line.starts_with("Audio: deafened")));
+        assert!(lines.iter().any(|line| line == "Whisper: Ana (not sent yet)"));
     }
 }

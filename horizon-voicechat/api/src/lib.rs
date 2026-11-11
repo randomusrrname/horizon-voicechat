@@ -28,17 +28,30 @@ use std::time::{Duration, Instant};
 
 use horizon_client::mod_api::{
     ClientDisconnectingEvent, ClientPacketEvent, ClientPlayerNetworkLoggingInEvent,
-    ClientStoppingEvent, ClientTickPreEvent, ClientboundPlayPacket, GuiRenderPostEvent, Hooks, Host,
-    KeyEvent, ServerboundPlayPacket,
+    ClientStoppingEvent, ClientTickPreEvent, ClientboundPlayPacket, Flow, GuiRenderPostEvent, Hooks,
+    Host, KeyEvent, ScreenCharTypedPreEvent, ScreenKeyPressedPreEvent,
+    ScreenMouseButtonPressedPreEvent, ScreenRenderPostEvent, ServerboundPlayPacket,
 };
 use net::session::{Event, UdpClient};
-use net::tcp::{self, channel, PlayerState, Secret};
+use net::tcp::{self, channel, Group, JoinedGroup, PlayerState, Secret};
 use net::udp::Packet;
 
 /// Hold to talk (vanilla key names, as `Hooks::key` gets them).
 const PUSH_TO_TALK: &str = "key.keyboard.v";
 /// Press to mute or unmute the microphone.
 const MUTE: &str = "key.keyboard.m";
+/// Press to open or close the group menu.
+const GROUPS: &str = "key.keyboard.g";
+const ENTER: &str = "key.keyboard.enter";
+const BACKSPACE: &str = "key.keyboard.backspace";
+
+/// How many group rows the menu draws before telling the player the rest are hidden.
+const MAX_GROUP_ROWS: usize = 10;
+/// Longest group name the text field accepts.
+const MAX_GROUP_NAME: usize = 32;
+
+/// The mod screen id (API 111) the group menu opens.
+const MENU_SCREEN: &str = "voicechat";
 
 /// How long a speaker stays in the indicator after the last voice frame (an end marker normally
 /// clears them at once; this is only for a lost one).
@@ -96,6 +109,20 @@ struct Inner {
     mic: Option<audio::Mic>,
     /// Every player's voice state the server told us about, by UUID.
     players: HashMap<[u8; 16], PlayerState>,
+    /// Every group the server announced, by UUID.
+    groups: HashMap<[u8; 16], Group>,
+    /// The group we are in, as far as the server has told us.
+    own_group: Option<[u8; 16]>,
+    /// Our own UUID, from the server's secret: how `state` messages name us.
+    own_id: Option<[u8; 16]>,
+    /// The group name being typed in the menu.
+    group_name: String,
+    /// The last thing the menu said, e.g. why a join did nothing.
+    menu_note: Option<String>,
+    /// A group name the menu asked to create, sent on the next tick.
+    pending_create: Option<String>,
+    /// An unknown group-related payload was already reported in the log.
+    unverified_logged: bool,
     /// When each speaker's voice was last heard, for the on-screen indicator.
     speaking: HashMap<[u8; 16], Instant>,
     push_to_talk: bool,
@@ -111,6 +138,20 @@ struct Resolving {
     secret: Secret,
     target: String,
     result: std::sync::mpsc::Receiver<Option<std::net::SocketAddr>>,
+}
+
+/// Where the group menu draws its parts, in GUI pixels.
+struct MenuLayout {
+    panel: [f32; 4],
+    name: [f32; 4],
+    create: [f32; 4],
+    rows: Vec<[f32; 4]>,
+}
+
+/// Whether `point` is inside `rect` (`[x, y, width, height]`).
+fn inside(rect: [f32; 4], point: [f32; 2]) -> bool {
+    let [x, y, w, h] = rect;
+    point[0] >= x && point[0] <= x + w && point[1] >= y && point[1] <= y + h
 }
 
 impl Inner {
@@ -134,12 +175,15 @@ impl Inner {
             }
             _ => lines.push(("Voice chat: connecting".to_owned(), COLOR_YELLOW)),
         }
+        if let Some(group) = self.own_group.and_then(|id| self.groups.get(&id)) {
+            lines.push((format!("Group: {}", group.name), COLOR_AQUA));
+        }
         if self.muted {
             lines.push(("Microphone: muted (M)".to_owned(), COLOR_RED));
         } else if self.push_to_talk {
             lines.push(("Microphone: talking (V)".to_owned(), COLOR_AQUA));
         } else {
-            lines.push(("Hold V to talk, M to mute".to_owned(), COLOR_GRAY));
+            lines.push(("Hold V to talk, M to mute, G for groups".to_owned(), COLOR_GRAY));
         }
         let mut names: Vec<&str> = self
             .speaking
@@ -168,20 +212,212 @@ impl Inner {
             channel::STATES => match tcp::parse_states(data) {
                 Ok(states) => {
                     for state in states {
-                        self.players.insert(state.player.0, state);
+                        self.track_state(state);
                     }
                 }
                 Err(e) => log(&format!("bad states packet: {e}")),
             },
             channel::STATE => match PlayerState::parse(data) {
-                Ok(state) => {
-                    self.players.insert(state.player.0, state);
-                }
+                Ok(state) => self.track_state(state),
                 Err(e) => log(&format!("bad state packet: {e}")),
             },
-            // Groups, categories and removals are heard but not used yet: there is no group menu.
+            channel::ADD_GROUP => match Group::parse(data) {
+                Ok(group) => {
+                    self.groups.insert(group.id.0, group);
+                }
+                Err(e) => log(&format!("bad add_group packet: {e}")),
+            },
+            channel::JOINED_GROUP => match JoinedGroup::parse(data) {
+                Ok(joined) => self.joined(joined),
+                Err(e) => log(&format!("bad joined_group packet: {e}")),
+            },
+            // Removal and category payloads have never been captured, so their layout is only a
+            // guess: say so once and leave the group list alone.
+            channel::REMOVE_GROUP
+            | channel::ADD_CATEGORY
+            | channel::REMOVE_CATEGORY
+            | channel::REMOVE_STATE => {
+                if !self.unverified_logged {
+                    self.unverified_logged = true;
+                    log(&format!(
+                        "ignoring {channel_name}: its layout has not been captured (groups may look stale)"
+                    ));
+                }
+            }
             _ => {}
         }
+    }
+
+    fn track_state(&mut self, state: PlayerState) {
+        if Some(state.player.0) == self.own_id {
+            self.own_group = state.group.map(|group| group.0);
+        }
+        self.players.insert(state.player.0, state);
+    }
+
+    /// The server answered a create or join request.
+    fn joined(&mut self, joined: JoinedGroup) {
+        if joined.in_group {
+            self.own_group = Some(joined.group.0);
+            self.menu_note = None;
+            let name = self
+                .groups
+                .get(&joined.group.0)
+                .map(|group| group.name.clone())
+                .unwrap_or_else(|| "the server's group".to_owned());
+            log(&format!("joined the voice group {name}"));
+        } else if joined.wrong_password {
+            self.menu_note = Some("The group's password was wrong.".to_owned());
+        } else {
+            self.menu_note = Some("The server refused the group.".to_owned());
+        }
+    }
+
+    /// The groups the menu lists, by name.
+    fn menu_groups(&self) -> Vec<&Group> {
+        let mut groups: Vec<&Group> = self.groups.values().collect();
+        groups.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        groups
+    }
+
+    /// Where the group menu draws each part for a window of `width` x `height` GUI pixels. The
+    /// drawing and the click handling both go through this, so they cannot drift apart.
+    fn menu_layout(&self, width: f32, height: f32) -> MenuLayout {
+        const W: f32 = 260.0;
+        const PAD: f32 = 8.0;
+        const LINE: f32 = 12.0;
+        const ROW: f32 = 13.0;
+        const FIELD: f32 = 14.0;
+        const GAP: f32 = 8.0;
+        let rows = self.menu_groups().len().min(MAX_GROUP_ROWS);
+        let h = PAD * 2.0
+            + LINE * 2.0
+            + rows as f32 * ROW
+            + 4.0
+            + FIELD
+            + GAP
+            + FIELD
+            + GAP
+            + LINE * 2.0;
+        let x = ((width - W) * 0.5).max(4.0);
+        let y = ((height - h) * 0.5).max(4.0);
+        let inner_x = x + PAD;
+        let inner_w = W - PAD * 2.0;
+        let mut cursor = y + PAD + LINE * 2.0;
+        let mut row_rects = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            row_rects.push([inner_x, cursor, inner_w, ROW]);
+            cursor += ROW;
+        }
+        cursor += 4.0;
+        let name = [inner_x, cursor, inner_w, FIELD];
+        cursor += FIELD + GAP;
+        let create = [inner_x, cursor, inner_w, FIELD];
+        MenuLayout { panel: [x, y, W, h], name, create, rows: row_rects }
+    }
+
+    /// Queues the group name for `create_group`, sent on the next tick where the host is mutable.
+    fn menu_create(&mut self) {
+        let name = self.group_name.trim().to_owned();
+        if name.is_empty() {
+            self.menu_note = Some("Type a name for the new group.".to_owned());
+            return;
+        }
+        self.group_name.clear();
+        self.pending_create = Some(name);
+    }
+
+    fn menu_type(&mut self, c: char) {
+        if c.is_control() || self.group_name.chars().count() >= MAX_GROUP_NAME {
+            return;
+        }
+        self.group_name.push(c);
+    }
+
+    fn menu_backspace(&mut self) {
+        self.group_name.pop();
+    }
+
+    /// A left click on the group menu: rows can only explain why they do nothing yet.
+    fn menu_click(&mut self, layout: &MenuLayout, mouse: [f32; 2]) {
+        if inside(layout.create, mouse) {
+            self.menu_create();
+            return;
+        }
+        if inside(layout.name, mouse) {
+            return;
+        }
+        let groups = self.menu_groups();
+        for (i, row) in layout.rows.iter().enumerate() {
+            if !inside(*row, mouse) {
+                continue;
+            }
+            let Some(group) = groups.get(i) else { return };
+            self.menu_note = Some(if Some(group.id.0) == self.own_group {
+                "Leaving needs the leave_group packet, which has not been captured yet.".to_owned()
+            } else {
+                "Joining needs the set_group packet, which has not been captured yet.".to_owned()
+            });
+            return;
+        }
+    }
+
+    /// Draws the group menu. `mouse` is the pointer in GUI pixels, for the hover highlight.
+    fn draw_menu(
+        &self,
+        host: &dyn Host,
+        batch: &mut horizon_client::mod_api::HudBatch,
+        width: f32,
+        height: f32,
+        mouse: [f32; 2],
+    ) {
+        let layout = self.menu_layout(width, height);
+        let [x, y, w, h] = layout.panel;
+        host.fill(batch, [x, y, w, h], 0xE0181818);
+        host.fill(batch, [x, y, w, 1.0], 0xFF55FFFF);
+        host.fill(batch, [x, y + h - 1.0, w, 1.0], 0xFF55FFFF);
+        host.text(batch, "Voice chat groups", [x + 8.0, y + 8.0], COLOR_AQUA, true);
+        let status = match self.own_group.and_then(|id| self.groups.get(&id)) {
+            Some(group) => format!("Your group: {}", group.name),
+            None => "You are not in a group".to_owned(),
+        };
+        host.text(batch, &status, [x + 8.0, y + 20.0], COLOR_GRAY, true);
+        let groups = self.menu_groups();
+        for (i, row) in layout.rows.iter().enumerate() {
+            let Some(group) = groups.get(i) else { break };
+            let hovered = inside(*row, mouse);
+            if hovered {
+                host.fill(batch, *row, 0x40FFFFFF);
+            }
+            let mut label = group.name.clone();
+            if group.has_password {
+                label.push_str("  (password)");
+            }
+            let color = if Some(group.id.0) == self.own_group { COLOR_AQUA } else { COLOR_GRAY };
+            host.text(batch, &label, [row[0] + 4.0, row[1] + 2.0], color, true);
+        }
+        host.fill(batch, layout.name, 0x60000000);
+        let typed = format!("New group: {}_", self.group_name);
+        host.text(batch, &typed, [layout.name[0] + 4.0, layout.name[1] + 3.0], COLOR_GRAY, true);
+        host.fill(batch, layout.create, 0x8055FF55);
+        host.text(
+            batch,
+            "Create group",
+            [layout.create[0] + 4.0, layout.create[1] + 3.0],
+            COLOR_GREEN,
+            true,
+        );
+        let note_y = layout.create[1] + layout.create[3] + 6.0;
+        if let Some(note) = &self.menu_note {
+            host.text(batch, note, [x + 8.0, note_y], COLOR_YELLOW, true);
+        }
+        let hidden = groups.len().saturating_sub(MAX_GROUP_ROWS);
+        let footer = if hidden > 0 {
+            format!("{hidden} more groups not shown. Enter creates, Esc closes.")
+        } else {
+            "Enter creates, Esc closes. Join and leave need a capture: disabled.".to_owned()
+        };
+        host.text(batch, &footer, [x + 8.0, note_y + 12.0], COLOR_GRAY, true);
     }
 
     fn connect(&mut self, secret: &Secret) {
@@ -189,6 +425,7 @@ impl Inner {
             log("got a secret but the server address is unknown");
             return;
         };
+        self.own_id = Some(secret.player.0);
         let target = secret.udp_target(&host);
         let (tx, rx) = std::sync::mpsc::channel();
         let lookup = target.clone();
@@ -362,8 +599,22 @@ impl Hooks for VoiceChat {
         }
     }
 
-    fn client_tick_pre(&self, _host: &mut dyn Host, _: &mut ClientTickPreEvent) {
-        self.state().tick();
+    fn client_tick_pre(&self, host: &mut dyn Host, _: &mut ClientTickPreEvent) {
+        let mut state = self.state();
+        state.tick();
+        // The screen hooks only have `&dyn Host`, so a create request waits here for a mutable one.
+        if let Some(name) = state.pending_create.take() {
+            match send_payload(host, channel::CREATE_GROUP, &tcp::create_group(&name, None)) {
+                Ok(()) => {
+                    state.menu_note = Some(format!("Asking the server for \"{name}\"..."));
+                    log(&format!("creating the voice group {name}"));
+                }
+                Err(e) => {
+                    state.menu_note = Some(format!("Could not create the group: {e}"));
+                    log(&format!("could not create the group: {e}"));
+                }
+            }
+        }
     }
 
     fn key(&self, host: &mut dyn Host, event: &mut KeyEvent<'_>) {
@@ -375,8 +626,82 @@ impl Hooks for VoiceChat {
                 state.muted = !state.muted;
                 log(if state.muted { "microphone muted" } else { "microphone on" });
             }
+            // Only from the world: with our screen open the key belongs to its text field, and
+            // Escape (or the gamepad) closes that.
+            GROUPS if event.pressed && host.playing() && host.mod_screen().is_none() => {
+                if host.mod_screen_open(MENU_SCREEN) {
+                    state.menu_note = None;
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Draws the group menu over the mod screen, and takes its clicks and keys (API 78 to 111).
+    fn screen_render_post(&self, host: &dyn Host, event: &mut ScreenRenderPostEvent<'_>) {
+        if event.screen.id != "mod" || host.mod_screen() != Some(MENU_SCREEN) {
+            return;
+        }
+        let state = self.state();
+        state.draw_menu(
+            host,
+            event.batch,
+            event.screen.rect[2],
+            event.screen.rect[3],
+            event.screen.mouse,
+        );
+    }
+
+    fn screen_mouse_button_pressed_pre(
+        &self,
+        host: &dyn Host,
+        event: &mut ScreenMouseButtonPressedPreEvent<'_>,
+    ) -> Flow {
+        if event.screen.id != "mod" || host.mod_screen() != Some(MENU_SCREEN) {
+            return Flow::Continue;
+        }
+        if event.button == 0 {
+            let mut state = self.state();
+            let layout = state.menu_layout(event.screen.rect[2], event.screen.rect[3]);
+            state.menu_click(&layout, event.screen.mouse);
+        }
+        // Nothing under the panel should react: the menu is modal.
+        Flow::Cancel
+    }
+
+    fn screen_key_pressed_pre(
+        &self,
+        host: &dyn Host,
+        event: &mut ScreenKeyPressedPreEvent<'_>,
+    ) -> Flow {
+        if event.screen.id != "mod" || host.mod_screen() != Some(MENU_SCREEN) {
+            return Flow::Continue;
+        }
+        match event.key {
+            // Escape and the gamepad close the screen; the game does that itself.
+            "key.keyboard.escape" => Flow::Continue,
+            ENTER if !event.repeat => {
+                self.state().menu_create();
+                Flow::Cancel
+            }
+            BACKSPACE => {
+                self.state().menu_backspace();
+                Flow::Cancel
+            }
+            _ => Flow::Continue,
+        }
+    }
+
+    fn screen_char_typed_pre(
+        &self,
+        host: &dyn Host,
+        event: &mut ScreenCharTypedPreEvent<'_>,
+    ) -> Flow {
+        if event.screen.id != "mod" || host.mod_screen() != Some(MENU_SCREEN) {
+            return Flow::Continue;
+        }
+        self.state().menu_type(event.c);
+        Flow::Cancel
     }
 
     /// A small panel in the lower left with the voice connection, the microphone and who is
@@ -528,5 +853,146 @@ mod tests {
         inner.speaking.insert([1; 16], Instant::now() - Duration::from_secs(5));
         inner.prune_speaking(Instant::now());
         assert!(inner.speaking.is_empty());
+    }
+
+    // Group payloads from capture 5 (a Paper server with Simple Voice Chat).
+    const ADD_GROUP: &str = "40180f619bd44f4c86a42e4b7ff394a9033131310100000000";
+    const JOINED_GROUP: &str = "0140180f619bd44f4c86a42e4b7ff394a900";
+    const STATE_IN_GROUP: &str =
+        "0000936a93914e253635bbc48eae6b883b2905356875745f0140180f619bd44f4c86a42e4b7ff394a9";
+
+    fn me() -> [u8; 16] {
+        let bytes = unhex("936a93914e253635bbc48eae6b883b29");
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&bytes);
+        id
+    }
+
+    fn group_id() -> [u8; 16] {
+        let bytes = unhex("40180f619bd44f4c86a42e4b7ff394a9");
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&bytes);
+        id
+    }
+
+    #[test]
+    fn the_group_list_and_our_group_come_from_the_server() {
+        let mut inner = Inner { own_id: Some(me()), ..Inner::default() };
+        inner.handle_message(channel::ADD_GROUP, &unhex(ADD_GROUP));
+        assert_eq!(inner.groups.len(), 1);
+        assert_eq!(inner.menu_groups()[0].name, "111");
+        assert!(inner.menu_groups()[0].has_password);
+
+        inner.handle_message(channel::STATE, &unhex(STATE_IN_GROUP));
+        assert_eq!(inner.own_group, Some(group_id()));
+
+        let lines: Vec<String> = inner.indicator_lines().into_iter().map(|(t, _)| t).collect();
+        assert!(lines.is_empty(), "no UDP session yet: the indicator stays hidden");
+
+        inner.handle_message(channel::JOINED_GROUP, &unhex(JOINED_GROUP));
+        assert_eq!(inner.own_group, Some(group_id()));
+    }
+
+    #[test]
+    fn a_state_for_another_player_does_not_change_our_group() {
+        let mut inner = Inner { own_id: Some(me()), ..Inner::default() };
+        inner.own_group = None;
+        inner.handle_message(channel::STATE, &unhex(STATE_IN_GROUP));
+        assert_eq!(inner.own_group, Some(group_id()));
+        inner.own_id = Some([0xFF; 16]);
+        inner.own_group = None;
+        inner.handle_message(channel::STATE, &unhex(STATE_IN_GROUP));
+        assert_eq!(inner.own_group, None, "another player's group is not ours");
+    }
+
+    #[test]
+    fn an_uncaptured_removal_leaves_the_list_alone() {
+        let mut inner = Inner::default();
+        inner.handle_message(channel::ADD_GROUP, &unhex(ADD_GROUP));
+        inner.handle_message(channel::REMOVE_GROUP, &[0xff, 0xff]);
+        inner.handle_message(channel::REMOVE_GROUP, &[0xff, 0xff]);
+        assert_eq!(inner.groups.len(), 1);
+        assert!(inner.unverified_logged);
+    }
+
+    #[test]
+    fn the_menu_puts_every_part_inside_its_panel() {
+        let mut inner = Inner::default();
+        inner.handle_message(channel::ADD_GROUP, &unhex(ADD_GROUP));
+        let layout = inner.menu_layout(1280.0, 720.0);
+        let [x, y, w, h] = layout.panel;
+        for rect in std::iter::once(layout.name)
+            .chain(std::iter::once(layout.create))
+            .chain(layout.rows.iter().copied())
+        {
+            assert!(rect[0] >= x && rect[1] >= y, "part starts before the panel");
+            assert!(rect[0] + rect[2] <= x + w, "part is wider than the panel");
+            assert!(rect[1] + rect[3] <= y + h, "part is below the panel");
+        }
+    }
+
+    #[test]
+    fn the_menu_caps_the_rows_it_draws() {
+        let mut inner = Inner::default();
+        for i in 0..MAX_GROUP_ROWS + 3 {
+            let mut payload = unhex(ADD_GROUP);
+            payload[0] = i as u8;
+            inner.handle_message(channel::ADD_GROUP, &payload);
+        }
+        assert_eq!(inner.groups.len(), MAX_GROUP_ROWS + 3);
+        assert_eq!(inner.menu_layout(320.0, 240.0).rows.len(), MAX_GROUP_ROWS);
+    }
+
+    #[test]
+    fn typing_a_name_queues_a_create_and_clears_the_field() {
+        let mut inner = Inner::default();
+        for c in "Ray".chars() {
+            inner.menu_type(c);
+        }
+        inner.menu_backspace();
+        inner.menu_type('y');
+        assert_eq!(inner.group_name, "Ray");
+        inner.menu_create();
+        assert_eq!(inner.pending_create.as_deref(), Some("Ray"));
+        assert!(inner.group_name.is_empty());
+
+        let sent = inner.pending_create.take(); // what the tick does
+        assert_eq!(sent.as_deref(), Some("Ray"));
+        inner.menu_create();
+        assert!(inner.pending_create.is_none(), "an empty name sends nothing");
+        assert!(inner.menu_note.is_some());
+
+        for _ in 0..MAX_GROUP_NAME + 5 {
+            inner.menu_type('x');
+        }
+        assert_eq!(inner.group_name.chars().count(), MAX_GROUP_NAME);
+    }
+
+    #[test]
+    fn clicking_a_group_explains_that_joins_are_disabled() {
+        let mut inner = Inner::default();
+        inner.handle_message(channel::ADD_GROUP, &unhex(ADD_GROUP));
+        let layout = inner.menu_layout(320.0, 240.0);
+        let row = layout.rows[0];
+        inner.menu_click(&layout, [row[0] + 2.0, row[1] + 2.0]);
+        let note = inner.menu_note.clone().unwrap();
+        assert!(note.contains("set_group"), "got {note}");
+        assert!(inner.pending_create.is_none());
+
+        let create = layout.create;
+        inner.group_name = "Ray".into();
+        inner.menu_click(&layout, [create[0] + 2.0, create[1] + 2.0]);
+        assert_eq!(inner.pending_create.as_deref(), Some("Ray"));
+    }
+
+    #[test]
+    fn a_refused_join_is_reported_in_the_menu() {
+        let mut inner = Inner::default();
+        let mut payload = vec![0x00];
+        payload.extend_from_slice(&group_id());
+        payload.push(0x00);
+        inner.handle_message(channel::JOINED_GROUP, &payload);
+        assert!(inner.own_group.is_none());
+        assert!(inner.menu_note.is_some());
     }
 }

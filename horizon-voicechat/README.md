@@ -41,15 +41,21 @@ On the server side, the UDP port (24454 by default) must be reachable from the c
 - Resolves the voice host on a helper thread (`voicechat-dns`), so a slow DNS lookup never stalls a tick (written, not compiled).
 - Decodes and mixes other players' voice (proximity and group), with a small jitter buffer and
   concealment of up to 3 lost frames.
+- Draws a small indicator in the lower left (API 410, `native_gui_render_post`): connection state,
+  microphone state and who is speaking. It follows F1.
+- A group menu of its own (API 111, `G`): lists the server's groups (`add_group`), shows the one
+  you are in (`joined_group`, `state`), and creates a group (`create_group`, a captured payload).
 
 ## Not done yet
 
 - Positional audio: voice plays the same in both ears at the same volume. Needs the speaker's
   position (the voice packets carry none; it would come from the entity list) and a stereo mix.
-- A group menu: `create_group`, joining with a password and `leave_group` are not wired (the
-  create payload is decoded and tested; the join payload is still unknown, see the protocol notes).
+- Joining a group and leaving one: the `set_group` and `leave_group` payloads have not been
+  captured, so the menu explains they are disabled instead of sending a guess. The join-with-
+  password path and the removal/category payloads (`remove_group`, `add_category`,
+  `remove_category`, `remove_state`) are unverified in the same way.
 - Whispers and deafening: the formats are not known yet (no capture has them).
-- A status indicator on screen (it only logs), configurable keys and volume.
+- Configurable keys and volume.
 - Sending the microphone from the game tick means frames leave in small bursts every 50 ms; a worker
   thread that owns the socket would fix that.
 

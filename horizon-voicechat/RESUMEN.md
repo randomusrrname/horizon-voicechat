@@ -79,8 +79,9 @@ Fecha: 2026-11-11. Implementación limpia (clean-room) del protocolo de Simple V
   `horizon-voicechat/dist/voicechat_client-0.1.0.hnmod`).
 - Enviado al registro con el formulario oficial: PR
   <https://github.com/horizon-rust/horizon-mods/pull/684> (`mods/voicechat_client.toml` +
-  `icons/voicechat_client.png`; el `.hnmod` va a la release `staging` del registro). Pendiente de
-  revisión y de las comprobaciones automáticas.
+  `icons/voicechat_client.png`; el `.hnmod` va a la release `staging` del registro). La comprobación
+  `check` pasó; `native-compat` falló instalando `libasound2-dev`/`libudev-dev` con `apt-get` antes de
+  compilar el mod (infraestructura de CI), avisado en el PR para que lo reintenten.
 
 ## Cómo compilar y probar
 

@@ -2,7 +2,7 @@
 # Build it with
 #   horizon-launcher native-build <this folder> --instance <instance> --trust-native-code
 [mod]
-id = "voicechat"
+id = "voicechat_client"
 version = "0.1.0"
 
 # The Horizon commit it is made for; unpinned, it builds on the instance's own.

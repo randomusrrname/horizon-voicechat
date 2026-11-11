@@ -1,0 +1,48 @@
+id = "voicechat_client"
+kind = "native-mod"
+name = "Simple Voice Chat Client"
+summary = "A from-scratch Simple Voice Chat client for Horizon: proximity voice, groups and a microphone settings page."
+description = """
+An unofficial, clean-room client for the [Simple Voice Chat](https://github.com/henkelmax/simple-voice-chat) protocol (compatibility 20), written in Rust for Horizon's native trait mods. It contains none of Simple Voice Chat's code.
+
+## What it does
+
+- **Menu (G):** connection status, the server's groups (create), the players (click one to pick a whisper target) and a **Settings** page that lists the system's microphones, switches between them without restarting and sets the input gain from 25% to 400%, with a live input meter.
+- **HUD:** connection, microphone level and state, own group, deafen, whisper target and who is speaking.
+- **Talking:** hold V (push to talk), M mutes, N deafens locally.
+- **Storage:** the microphone choice and gain are saved in the mod's own data folder (`horizon-mods/.horizon-mod-data/voicechat_client/settings.txt`).
+
+## What is not enabled
+
+- Joining or leaving a group, whispers and deafen over the network: their payloads have not been captured, so nothing is sent and the menu says so. Deafen and whisper stay local.
+- The mod has **not been tested against a real Simple Voice Chat server**: the handshake and audio are implemented from captures but are not verified end to end. The microphone settings page has not been run with real hardware in-game yet.
+- Group removal, categories and removals are ignored with a log warning for the same reason.
+
+## What it touches
+
+- The server's `voicechat:*` custom payloads (read-only) and one UDP connection to the server's voice port, encrypted with AES-128-GCM using the server's secret.
+- The default speakers and the chosen microphone through cpal; the game's `rusty-opus`.
+- It contacts no host other than the Minecraft server you are on (and DNS for it).
+
+## Not affiliated
+
+This project is not made, endorsed or supported by Max Henkel or the Simple Voice Chat project.
+
+## Tested
+
+The network core passes 30 protocol tests on captured packets. The mod passes 45 unit tests against the real `horizon-client` crate, and the client builds on Horizon `2ebf00a`. Not tested: a real server, a real microphone and the in-game settings page.
+"""
+authors = ["randomusrrname"]
+license = "MIT"
+source = "https://github.com/randomusrrname/horizon-voicechat"
+icon = "icons/voicechat_client.png"
+categories = ["social"]
+tags = ["voice-chat", "proximity-chat", "simple-voice-chat", "microphone", "push-to-talk"]
+
+[[versions]]
+version = "0.1.0"
+published = "2026-11-11"
+game = "26.3"
+file = "voicechat_client-0.1.0.hnmod"
+sha256 = "6e3780e95a52f1c17f0c59f9deb81eb54668e5aa472ecfc69580f7385d73b6cd"
+changelog = "First release: push-to-talk, HUD, group list and creation, local deafen/whisper, and a settings page for the microphone and its gain. Not tested against a real server; group join/leave, whispers and deafen over the network are disabled until their payloads are captured."

@@ -8,7 +8,7 @@
 #   powershell -ExecutionPolicy Bypass -File hnmod/package.ps1
 #   powershell -ExecutionPolicy Bypass -File hnmod/package.ps1 -Work D:\tmp\voicechat-hnmod
 #
-# Resultado: <Work>/horizon-mods/native/target/voicechat-<version>.hnmod
+# Resultado: <Work>/horizon-mods/native/target/voicechat_client-<version>.hnmod
 param(
     [string]$Work = (Join-Path $env:TEMP "horizon-voicechat-hnmod"),
     [string]$Tool = "https://raw.githubusercontent.com/horizon-rust/horizon-mods/main/native/tools/native.py"
@@ -18,8 +18,8 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path $PSScriptRoot -Parent
 $tree = Join-Path $Work "horizon-mods"
 $native = Join-Path $tree "native"
-$mod = Join-Path $native "voicechat"
-$bundle = Join-Path $mod "mixins\voicechat"
+$mod = Join-Path $native "voicechat_client"
+$bundle = Join-Path $mod "mixins\voicechat_client"
 
 Write-Host "Preparing $tree"
 Remove-Item $tree -Recurse -Force -ErrorAction SilentlyContinue
@@ -40,4 +40,4 @@ if (Test-Path $license) {
 }
 
 Write-Host "Packaging"
-python (Join-Path $native "tools\native.py") package voicechat
+python (Join-Path $native "tools\native.py") package voicechat_client

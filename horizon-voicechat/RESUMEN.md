@@ -54,7 +54,7 @@ Fecha: 2026-11-11. Implementación limpia (clean-room) del protocolo de Simple V
 - El estado se resuelve en `hud_view()`, `status()`, `mic_state()` y `menu_players()`; el dibujo no
   lee la sesión. `menu_layout()` lo usan tanto el dibujo como los clics, así no se desalinean.
 - **37/37** tests propios contra el `horizon-client` real.
-- Commit: `Step 5: Plasmo-style GUI (tabs, rows, live mic meter, player whisper pick)`.
+- Commit: `a8bd2d8` — `Step 5: Plasmo-style GUI (tabs, rows, live mic meter, player whisper pick)`.
 
 ## Cómo compilar y probar
 
@@ -85,7 +85,8 @@ Tests:
   `native.py package` (solo escribe el zip: no compila ni ejecuta nada).
 - Generado: `voicechat-0.1.0.hnmod`, 39 276 bytes, sha256
   `e890fccd58f8c863ad886a6d40ae36cb32d211658362ecaa580a905d15990a28`. Contiene
-  `horizon-native.json`, `horizon-mixin.toml` y todo `api/src` (incluido `ui.rs`).
+  `horizon-native.json`, `horizon-mixin.toml` y todo `api/src` (incluido `ui.rs`). Comprobado que sus
+  11 archivos coinciden byte a byte con el árbol de trabajo.
 - Sin `LICENSE` en el proyecto, el zip no lleva licencia: hay que elegirla antes de publicar.
 
 ## No verificado

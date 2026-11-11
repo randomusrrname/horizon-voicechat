@@ -48,6 +48,10 @@ horizon-launcher.exe native-build "C:\Users\Mauro\Documents\Horizon Voicechat\ho
   --instance horizon --version nightly-2026-11-07-2ebf00a --trust-native-code
 ```
 
+Última compilación verificada: `native-2ebf00a-77c0cecc2973`, seleccionada para la instancia
+`horizon` (compilación incremental de 8 min 11 s). Commits: `cd7a480` (paso 1), `c951b37`
+(paso 2), `c4609fc` (paso 3), `86af919` (paso 4).
+
 El `--version nightly-2026-11-07-2ebf00a` es necesario en este entorno: sin él el launcher basa la
 compilación en `c9d474d` en vez del commit fijado.
 

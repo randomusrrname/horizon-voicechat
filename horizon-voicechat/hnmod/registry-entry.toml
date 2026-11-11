@@ -33,8 +33,10 @@ This project is not made, endorsed or supported by Max Henkel or the Simple Voic
 The network core passes 30 protocol tests on captured packets. The mod passes 45 unit tests against the real `horizon-client` crate, and the client builds on Horizon `2ebf00a`. Not tested: a real server, a real microphone and the in-game settings page.
 """
 authors = ["randomusrrname"]
+owners = ["randomusrrname"]
+owner_ids = [308101690]
 license = "MIT"
-source = "https://github.com/randomusrrname/horizon-voicechat"
+source = "https://github.com/randomusrrname/horizon-voicechat/tree/main/horizon-voicechat"
 icon = "icons/voicechat_client.png"
 categories = ["social"]
 tags = ["voice-chat", "proximity-chat", "simple-voice-chat", "microphone", "push-to-talk"]

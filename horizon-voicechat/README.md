@@ -107,4 +107,5 @@ not compile the mod. See `hnmod/README.md`.
 Horizon's `CONTRIBUTING.md` and `CLAUDE.md` ask contributors to check open work first. Issue #7759
 was opened by someone building the same thing as a native mod, so coordinate with them before opening
 a PR. The project is MIT (`LICENSE` at the root, so the `.hnmod` carries it); Simple Voice Chat's
-author should be asked for the protocol spec and whether he wants credit.
+author should be asked for the protocol spec and whether he wants credit. Source and packaged build:
+<https://github.com/randomusrrname/horizon-voicechat>.

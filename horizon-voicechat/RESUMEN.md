@@ -71,6 +71,17 @@ Fecha: 2026-11-11. Implementación limpia (clean-room) del protocolo de Simple V
 - **45/45** tests propios (8 nuevos: página de ajustes, límites de ganancia, ciclo de pestañas,
   persistencia al reconectar y formato del archivo).
 
+### Paso 7 — publicación del código y del paquete
+- Repositorio público: <https://github.com/randomusrrname/horizon-voicechat> (rama `main`), con el
+  mod, el núcleo de protocolo y el `LICENSE` MIT en la raíz.
+- Paquete descargable:
+  <https://github.com/randomusrrname/horizon-voicechat/releases/tag/v0.1.0> (también en
+  `horizon-voicechat/dist/voicechat_client-0.1.0.hnmod`).
+- Enviado al registro con el formulario oficial: PR
+  <https://github.com/horizon-rust/horizon-mods/pull/684> (`mods/voicechat_client.toml` +
+  `icons/voicechat_client.png`; el `.hnmod` va a la release `staging` del registro). Pendiente de
+  revisión y de las comprobaciones automáticas.
+
 ## Cómo compilar y probar
 
 ```
@@ -134,5 +145,5 @@ Tests:
 4. Teclas configurables y volumen de salida (el de entrada ya está en Settings).
 5. Elegir licencia (y añadirla a la raíz para que el `.hnmod` la lleve), coordinar con el issue
    #7759 de Horizon y pedir permiso/crédito al autor de Simple Voice Chat antes de publicar.
-6. Publicar en el registro: hace falta que el launcher y `cargo-horizon-mod` de Horizon acepten
-   mods nativos del registro, y revisar el `.hnmod` con el equipo de horizon-mods.
+6. Revisar las comprobaciones y la revisión del PR #684 de horizon-mods; si se pide algo, está en
+   `hnmod/registry-entry.toml` y en la release `v0.1.0`.

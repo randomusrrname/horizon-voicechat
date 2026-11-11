@@ -14,14 +14,16 @@
 //!    and the UDP session starts (`net::session::UdpClient`). Once connected the audio devices open.
 //! 4. While the push-to-talk key is held, microphone frames are Opus-encoded and sent; other
 //!    players' voice frames are decoded and played.
-//! 5. `G` opens a group menu drawn by the mod itself (API 111); it lists the server's groups and
-//!    creates one. `N` deafens locally and `H` picks a whisper target, both without sending
-//!    anything: those payloads have not been captured.
+//! 5. `G` opens a menu drawn by the mod itself (API 111): the server's groups (create), the
+//!    players (click one to whisper) and a settings page that picks the microphone and its gain.
+//!    `N` deafens locally and `H` picks a whisper target, both without sending anything: those
+//!    payloads have not been captured.
 
 mod audio;
 // The protocol core; categories and removals are kept for when a capture confirms them.
 #[allow(dead_code)]
 mod net;
+mod settings;
 mod ui;
 mod util;
 
@@ -39,7 +41,8 @@ use horizon_client::mod_api::{
 use net::session::{Event, UdpClient};
 use net::tcp::{self, channel, Group, JoinedGroup, PlayerState, Secret};
 use net::udp::Packet;
-use ui::{GroupRow, HudView, MenuTab, MenuView, MicState, PlayerRow, Status};
+use settings::Settings;
+use ui::{DeviceRow, GroupRow, HudView, MenuTab, MenuView, MicState, PlayerRow, Status};
 
 /// Hold to talk (vanilla key names, as `Hooks::key` gets them).
 const PUSH_TO_TALK: &str = "key.keyboard.v";
@@ -59,8 +62,9 @@ const ENTER: &str = "key.keyboard.enter";
 const BACKSPACE: &str = "key.keyboard.backspace";
 const TAB: &str = "key.keyboard.tab";
 
-/// The mod screen id (API 111) the group menu opens.
-const MENU_SCREEN: &str = "voicechat";
+/// The bundle id: the mod screen id, the API 111 screen it opens, and the name of the mod's
+/// data folder where its settings live. (`voicechat` itself is another mod's registry id.)
+const MOD_ID: &str = "voicechat_client";
 
 /// How long a speaker stays in the indicator after the last voice frame (an end marker normally
 /// clears them at once; this is only for a lost one).
@@ -134,6 +138,13 @@ struct Inner {
     pending_create: Option<String>,
     /// Ticks since the menu opened, for the text caret's blink.
     menu_ticks: u32,
+    /// The microphone and gain the player picked, and whether the file was read this session.
+    settings: Settings,
+    settings_loaded: bool,
+    /// The settings changed and must reach the audio thread and the file on the next tick.
+    settings_dirty: bool,
+    /// The microphones cpal reported when the menu opened, for the settings page.
+    input_devices: Vec<String>,
     /// An unknown group-related payload was already reported in the log.
     unverified_logged: bool,
     /// When each speaker's voice was last heard, for the on-screen indicator.
@@ -170,12 +181,16 @@ fn frame_level(frame: &[f32]) -> f32 {
 }
 
 impl Inner {
-    /// Forgets the session: drops the sockets and closes the audio devices.
+    /// Forgets the session: drops the sockets and closes the audio devices. The player's
+    /// microphone choice, its gain and mute/deafen stay.
     fn reset(&mut self) {
         let (muted, deafened) = (self.muted, self.deafened);
+        let (settings, settings_loaded) = (self.settings.clone(), self.settings_loaded);
         *self = Inner::default();
         self.muted = muted;
         self.deafened = deafened;
+        self.settings = settings;
+        self.settings_loaded = settings_loaded;
     }
 
     /// Deafens or undeafens. Local: the microphone and the network are untouched.
@@ -358,13 +373,68 @@ impl Inner {
     /// Where the menu draws each part for a window of `width` x `height` GUI pixels. The
     /// drawing and the click handling both go through this, so they cannot drift apart.
     fn menu_layout(&self, width: f32, height: f32) -> ui::MenuLayout {
-        ui::menu_layout(self.menu_tab, self.groups.len(), self.players.len(), width, height)
+        // The settings page always has its "System default" row.
+        let devices = 1 + self.input_devices.iter().take(ui::MAX_DEVICES - 1).count();
+        ui::menu_layout(
+            self.menu_tab,
+            self.groups.len(),
+            self.players.len(),
+            devices,
+            width,
+            height,
+        )
+    }
+
+    /// Asks cpal for the microphones, for the settings page. Done when the menu opens, not every
+    /// frame: enumerating devices is not free.
+    fn refresh_devices(&mut self) {
+        self.input_devices = audio::input_devices();
+        if self.input_devices.is_empty() {
+            self.menu_note = Some("No microphone devices found.".to_owned());
+        }
+    }
+
+    /// Reads the settings file once, from the mod's own data folder.
+    fn ensure_settings(&mut self, host: &dyn Host) {
+        if self.settings_loaded {
+            return;
+        }
+        self.settings_loaded = true;
+        self.settings = Settings::load(&host.data_dir(MOD_ID));
+    }
+
+    /// Pushes the chosen microphone and gain to the audio thread. Called when they change and
+    /// right after the devices open.
+    fn apply_audio_settings(&self) {
+        let Some(audio) = &self.audio else { return };
+        audio.set_gain(self.settings.gain);
+        audio.set_input(self.settings.input.as_deref());
+    }
+
+    fn save_settings(&self, host: &dyn Host) {
+        if let Err(e) = self.settings.save(&host.data_dir(MOD_ID)) {
+            log(&format!("could not save the settings: {e}"));
+        }
+    }
+
+    /// Reads the settings the first time and, when they changed, sends them to the audio thread
+    /// and writes the file. Only ticks have a `Host`, and only they need one.
+    fn sync_settings(&mut self, host: &dyn Host) {
+        self.ensure_settings(host);
+        if self.settings_dirty {
+            self.settings_dirty = false;
+            self.apply_audio_settings();
+            self.save_settings(host);
+        }
     }
 
     /// Switches pages, clearing the last note so it does not look like it belongs to the new one.
     fn menu_tab_next(&mut self) {
         self.menu_tab = self.menu_tab.next();
         self.menu_note = None;
+        if self.menu_tab == MenuTab::Settings {
+            self.refresh_devices();
+        }
     }
 
     /// Queues the group name for `create_group`, sent on the next tick where the host is mutable.
@@ -389,15 +459,19 @@ impl Inner {
         self.group_name.pop();
     }
 
-    /// A left click on the menu: tabs switch pages, a player becomes the whisper target, and a
-    /// group row can only explain why joining or leaving does nothing yet.
+    /// A left click on the menu: tabs switch pages, a player becomes the whisper target, a
+    /// group row can only explain why joining or leaving does nothing yet, and the settings
+    /// page picks a microphone or moves its gain.
     fn menu_click(&mut self, layout: &ui::MenuLayout, mouse: [f32; 2]) {
         for (i, rect) in layout.tabs.iter().enumerate() {
             if ui::inside(*rect, mouse) {
-                let tab = if i == 0 { MenuTab::Groups } else { MenuTab::Players };
+                let Some(tab) = MenuTab::ALL.get(i).copied() else { return };
                 if self.menu_tab != tab {
                     self.menu_tab = tab;
                     self.menu_note = None;
+                    if tab == MenuTab::Settings {
+                        self.refresh_devices();
+                    }
                 }
                 return;
             }
@@ -446,6 +520,43 @@ impl Inner {
                     return;
                 }
             }
+            MenuTab::Settings => {
+                if ui::inside(layout.minus, mouse) {
+                    self.settings.nudge_gain(-settings::GAIN_STEP);
+                    self.settings_dirty = true;
+                    self.menu_note =
+                        Some(format!("Microphone gain: {}%", self.settings.gain_percent()));
+                    return;
+                }
+                if ui::inside(layout.plus, mouse) {
+                    self.settings.nudge_gain(settings::GAIN_STEP);
+                    self.settings_dirty = true;
+                    self.menu_note =
+                        Some(format!("Microphone gain: {}%", self.settings.gain_percent()));
+                    return;
+                }
+                for (i, row) in layout.rows.iter().enumerate() {
+                    if !ui::inside(*row, mouse) {
+                        continue;
+                    }
+                    // Row 0 is the system default; the rest follow the enumerated devices.
+                    let chosen = if i == 0 {
+                        None
+                    } else {
+                        match self.input_devices.get(i - 1) {
+                            Some(name) => Some(name.clone()),
+                            None => return,
+                        }
+                    };
+                    self.settings.input = chosen;
+                    self.settings_dirty = true;
+                    self.menu_note = Some(match &self.settings.input {
+                        Some(name) => format!("Microphone: {name}"),
+                        None => "Microphone: the system default".to_owned(),
+                    });
+                    return;
+                }
+            }
         }
     }
 
@@ -480,6 +591,19 @@ impl Inner {
                 whisper: self.whisper == Some(p.player.0),
             })
             .collect();
+        let mut devices: Vec<DeviceRow<'_>> = Vec::with_capacity(ui::MAX_DEVICES);
+        devices.push(DeviceRow {
+            name: "System default",
+            selected: self.settings.input.is_none(),
+            default: true,
+        });
+        for name in self.input_devices.iter().take(ui::MAX_DEVICES - 1) {
+            devices.push(DeviceRow {
+                name,
+                selected: self.settings.input.as_deref() == Some(name.as_str()),
+                default: false,
+            });
+        }
         let view = MenuView {
             tab: self.menu_tab,
             status: self.status(),
@@ -487,6 +611,9 @@ impl Inner {
             player_count: self.players.len(),
             groups,
             players,
+            devices,
+            gain: self.settings.gain,
+            level: self.mic_level,
             group_name: &self.group_name,
             caret: (self.menu_ticks / 8) % 2 == 0,
             note: self.menu_note.as_deref(),
@@ -540,7 +667,7 @@ impl Inner {
         if self.audio.is_some() {
             return;
         }
-        match audio::Audio::new() {
+        match audio::Audio::new(self.settings.input.as_deref(), self.settings.gain) {
             Ok(audio) => {
                 if !audio.has_input() {
                     log("no microphone: you can listen but not talk");
@@ -682,6 +809,7 @@ impl Hooks for VoiceChat {
 
     fn client_tick_pre(&self, host: &mut dyn Host, _: &mut ClientTickPreEvent) {
         let mut state = self.state();
+        state.sync_settings(host);
         state.tick();
         // The screen hooks only have `&dyn Host`, so a create request waits here for a mutable one.
         if let Some(name) = state.pending_create.take() {
@@ -710,11 +838,13 @@ impl Hooks for VoiceChat {
             // Only from the world: with our screen open the key belongs to its text field, and
             // Escape (or the gamepad) closes that.
             GROUPS if event.pressed && in_world(host) && host.mod_screen().is_none() => {
-                if host.mod_screen_open(MENU_SCREEN) {
+                if host.mod_screen_open(MOD_ID) {
                     state.menu_note = None;
                     state.menu_tab = MenuTab::Groups;
                     state.group_name.clear();
                     state.menu_ticks = 0;
+                    state.ensure_settings(host);
+                    state.refresh_devices();
                 }
             }
             DEAFEN if event.pressed && in_world(host) => {
@@ -739,7 +869,7 @@ impl Hooks for VoiceChat {
 
     /// Draws the group menu over the mod screen, and takes its clicks and keys (API 78 to 111).
     fn screen_render_post(&self, host: &dyn Host, event: &mut ScreenRenderPostEvent<'_>) {
-        if event.screen.id != "mod" || host.mod_screen() != Some(MENU_SCREEN) {
+        if event.screen.id != "mod" || host.mod_screen() != Some(MOD_ID) {
             return;
         }
         let state = self.state();
@@ -757,7 +887,7 @@ impl Hooks for VoiceChat {
         host: &dyn Host,
         event: &mut ScreenMouseButtonPressedPreEvent<'_>,
     ) -> Flow {
-        if event.screen.id != "mod" || host.mod_screen() != Some(MENU_SCREEN) {
+        if event.screen.id != "mod" || host.mod_screen() != Some(MOD_ID) {
             return Flow::Continue;
         }
         if event.button == 0 {
@@ -774,7 +904,7 @@ impl Hooks for VoiceChat {
         host: &dyn Host,
         event: &mut ScreenKeyPressedPreEvent<'_>,
     ) -> Flow {
-        if event.screen.id != "mod" || host.mod_screen() != Some(MENU_SCREEN) {
+        if event.screen.id != "mod" || host.mod_screen() != Some(MOD_ID) {
             return Flow::Continue;
         }
         match event.key {
@@ -807,7 +937,7 @@ impl Hooks for VoiceChat {
         host: &dyn Host,
         event: &mut ScreenCharTypedPreEvent<'_>,
     ) -> Flow {
-        if event.screen.id != "mod" || host.mod_screen() != Some(MENU_SCREEN) {
+        if event.screen.id != "mod" || host.mod_screen() != Some(MOD_ID) {
             return Flow::Continue;
         }
         let mut state = self.state();
@@ -1227,5 +1357,64 @@ mod tests {
         with_player(&mut inner, [0xAA; 16], "Me");
         let names: Vec<&str> = inner.menu_players().iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["Me", "Ana"]);
+    }
+
+    #[test]
+    fn the_settings_page_picks_a_microphone_and_changes_the_gain() {
+        let mut inner =
+            Inner { input_devices: vec!["USB Mic".to_owned()], ..Inner::default() };
+        inner.menu_tab = MenuTab::Settings;
+        let layout = inner.menu_layout(1280.0, 720.0);
+        assert_eq!(layout.rows.len(), 2, "the system default row and USB Mic");
+        assert!(layout.gain_bar[2] > 0.0);
+
+        let plus = [layout.plus[0] + 2.0, layout.plus[1] + 2.0];
+        inner.menu_click(&layout, plus);
+        inner.menu_click(&layout, plus);
+        assert_eq!(inner.settings.gain, 1.5);
+        assert!(inner.settings_dirty, "the change has to reach the audio thread");
+        inner.menu_click(&layout, [layout.minus[0] + 2.0, layout.minus[1] + 2.0]);
+        assert_eq!(inner.settings.gain, 1.25);
+
+        let mic = layout.rows[1];
+        inner.menu_click(&layout, [mic[0] + 2.0, mic[1] + 2.0]);
+        assert_eq!(inner.settings.input.as_deref(), Some("USB Mic"));
+
+        let default = layout.rows[0];
+        inner.menu_click(&layout, [default[0] + 2.0, default[1] + 2.0]);
+        assert!(inner.settings.input.is_none(), "row 0 follows the system default");
+    }
+
+    #[test]
+    fn gain_clicks_stop_at_the_allowed_range() {
+        let mut inner = Inner { menu_tab: MenuTab::Settings, ..Inner::default() };
+        let layout = inner.menu_layout(1280.0, 720.0);
+        for _ in 0..40 {
+            inner.menu_click(&layout, [layout.plus[0] + 2.0, layout.plus[1] + 2.0]);
+        }
+        assert_eq!(inner.settings.gain, settings::MAX_GAIN);
+        for _ in 0..40 {
+            inner.menu_click(&layout, [layout.minus[0] + 2.0, layout.minus[1] + 2.0]);
+        }
+        assert_eq!(inner.settings.gain, settings::MIN_GAIN);
+    }
+
+    #[test]
+    fn tab_cycles_through_all_three_pages() {
+        assert_eq!(MenuTab::Groups.next(), MenuTab::Players);
+        assert_eq!(MenuTab::Players.next(), MenuTab::Settings);
+        assert_eq!(MenuTab::Settings.next(), MenuTab::Groups);
+    }
+
+    #[test]
+    fn the_microphone_choice_survives_a_reconnect() {
+        let mut inner = Inner::default();
+        inner.settings.input = Some("USB Mic".to_owned());
+        inner.settings.gain = 2.0;
+        inner.settings_loaded = true;
+        inner.reset();
+        assert_eq!(inner.settings.input.as_deref(), Some("USB Mic"));
+        assert_eq!(inner.settings.gain, 2.0);
+        assert!(inner.settings_loaded, "a reconnect must not reread the file");
     }
 }

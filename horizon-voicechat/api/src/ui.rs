@@ -1,4 +1,4 @@
-//! The mod's own look: the voice HUD in the corner of the world and the group menu.
+//! The mod's own look: the voice HUD in the corner of the world and the group/settings menu.
 //!
 //! The native API only gives mods solid rectangles (`Host::fill`) and the game's font
 //! (`Host::text`/`text_width`), so the look is built from those: dark translucent panels with a
@@ -9,7 +9,11 @@
 
 use horizon_client::mod_api::{Host, HudBatch};
 
+use crate::settings::{MAX_GAIN, MIN_GAIN};
+
 pub const MAX_ROWS: usize = 10;
+/// Input devices the settings page lists, the first row being "System default".
+pub const MAX_DEVICES: usize = 6;
 /// The most speakers the HUD lists before collapsing the rest into a count.
 const MAX_SPEAKERS: usize = 4;
 
@@ -43,6 +47,7 @@ const ROW: f32 = 16.0;
 const FIELD: f32 = 20.0;
 const LINE: f32 = 11.0;
 const CREATE_W: f32 = 86.0;
+const GAIN_BUTTON: f32 = 26.0;
 const GAP: f32 = 6.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -50,20 +55,25 @@ pub enum MenuTab {
     #[default]
     Groups,
     Players,
+    Settings,
 }
 
 impl MenuTab {
+    pub const ALL: [MenuTab; 3] = [MenuTab::Groups, MenuTab::Players, MenuTab::Settings];
+
     pub fn label(self) -> &'static str {
         match self {
             MenuTab::Groups => "Groups",
             MenuTab::Players => "Players",
+            MenuTab::Settings => "Settings",
         }
     }
 
     pub fn next(self) -> MenuTab {
         match self {
             MenuTab::Groups => MenuTab::Players,
-            MenuTab::Players => MenuTab::Groups,
+            MenuTab::Players => MenuTab::Settings,
+            MenuTab::Settings => MenuTab::Groups,
         }
     }
 }
@@ -145,6 +155,14 @@ pub struct PlayerRow<'a> {
     pub whisper: bool,
 }
 
+/// One line of the settings page's microphone list.
+pub struct DeviceRow<'a> {
+    pub name: &'a str,
+    pub selected: bool,
+    /// The synthetic "System default" row, which follows whatever Windows picks.
+    pub default: bool,
+}
+
 /// What the menu shows, already resolved by `Inner` (sorted groups and players).
 pub struct MenuView<'a> {
     pub tab: MenuTab,
@@ -153,6 +171,12 @@ pub struct MenuView<'a> {
     pub player_count: usize,
     pub groups: Vec<GroupRow<'a>>,
     pub players: Vec<PlayerRow<'a>>,
+    /// "System default" first, then the input devices that fit.
+    pub devices: Vec<DeviceRow<'a>>,
+    /// Microphone gain, `MIN_GAIN` to `MAX_GAIN`.
+    pub gain: f32,
+    /// Live microphone level, for the meter beside the settings title.
+    pub level: f32,
     pub group_name: &'a str,
     /// Blink phase for the text caret.
     pub caret: bool,
@@ -163,12 +187,17 @@ pub struct MenuView<'a> {
 /// cannot drift apart.
 pub struct MenuLayout {
     pub panel: [f32; 4],
-    pub header: [f32; 4],
-    pub tabs: [[f32; 4]; 2],
+    pub tabs: [[f32; 4]; 3],
+    /// The small title above the rows.
+    pub section: [f32; 2],
     pub rows: Vec<[f32; 4]>,
-    /// The group-name field and the create button (empty rectangles on the players tab).
+    /// The group-name field and the create button (empty rectangles on other pages).
     pub name: [f32; 4],
     pub create: [f32; 4],
+    /// The gain bar and its two buttons (empty rectangles outside Settings).
+    pub gain_bar: [f32; 4],
+    pub minus: [f32; 4],
+    pub plus: [f32; 4],
     pub note: [f32; 2],
     pub footer: [f32; 2],
 }
@@ -183,26 +212,30 @@ pub fn menu_layout(
     tab: MenuTab,
     group_count: usize,
     player_count: usize,
+    device_count: usize,
     width: f32,
     height: f32,
 ) -> MenuLayout {
     let visible = match tab {
         MenuTab::Groups => group_count.min(MAX_ROWS),
         MenuTab::Players => player_count.min(MAX_ROWS),
+        // The "System default" row is always there, even with no devices.
+        MenuTab::Settings => device_count.clamp(1, MAX_DEVICES),
     };
-    let w = 360.0_f32.min((width - 12.0).max(240.0));
+    let w = 380.0_f32.min((width - 12.0).max(260.0));
     let inner_w = w - PAD * 2.0;
     let list_h = visible as f32 * ROW;
     let form_h = match tab {
-        MenuTab::Groups => 8.0 + FIELD + 8.0,
         MenuTab::Players => 6.0,
+        MenuTab::Groups | MenuTab::Settings => 8.0 + FIELD + 8.0,
     };
-    // Two lines under the list: the note and the key hints.
     let h = PAD * 2.0
         + HEADER
         + GAP
         + TABS
         + 8.0
+        + LINE
+        + 4.0
         + list_h
         + form_h
         + 10.0
@@ -212,37 +245,53 @@ pub fn menu_layout(
     let y = ((height - h) * 0.5).max(6.0);
     let inner_x = x + PAD;
     let tab_y = y + HEADER + GAP;
-    let tab_w = (inner_w - GAP) * 0.5;
-    let tabs = [
-        [inner_x, tab_y, tab_w, TABS],
-        [inner_x + tab_w + GAP, tab_y, tab_w, TABS],
-    ];
-    let mut cursor = tab_y + TABS + 8.0;
+    let tab_w = (inner_w - GAP * 2.0) / 3.0;
+    let mut tabs = [[0.0; 4]; 3];
+    for (i, rect) in tabs.iter_mut().enumerate() {
+        *rect = [inner_x + i as f32 * (tab_w + GAP), tab_y, tab_w, TABS];
+    }
+    let section = [inner_x, tab_y + TABS + 8.0];
+    let mut cursor = section[1] + LINE + 4.0;
     let mut rows = Vec::with_capacity(visible);
     for _ in 0..visible {
         rows.push([inner_x, cursor, inner_w, ROW]);
         cursor += ROW;
     }
-    let (name, create, form_end) = if tab == MenuTab::Groups {
-        let field_y = cursor + 8.0;
-        let name_w = inner_w - CREATE_W - GAP;
-        (
-            [inner_x, field_y, name_w, FIELD],
-            [inner_x + name_w + GAP, field_y, CREATE_W, FIELD],
-            field_y + FIELD,
-        )
-    } else {
-        ([0.0; 4], [0.0; 4], cursor + 6.0)
+    let mut name = [0.0; 4];
+    let mut create = [0.0; 4];
+    let mut gain_bar = [0.0; 4];
+    let mut minus = [0.0; 4];
+    let mut plus = [0.0; 4];
+    let form_end = match tab {
+        MenuTab::Groups => {
+            let field_y = cursor + 8.0;
+            let name_w = inner_w - CREATE_W - GAP;
+            name = [inner_x, field_y, name_w, FIELD];
+            create = [inner_x + name_w + GAP, field_y, CREATE_W, FIELD];
+            field_y + FIELD
+        }
+        MenuTab::Players => cursor + 6.0,
+        MenuTab::Settings => {
+            let field_y = cursor + 8.0;
+            let bar_w = inner_w - 2.0 * (GAIN_BUTTON + GAP);
+            gain_bar = [inner_x, field_y, bar_w, FIELD];
+            minus = [inner_x + bar_w + GAP, field_y, GAIN_BUTTON, FIELD];
+            plus = [minus[0] + GAIN_BUTTON + GAP, field_y, GAIN_BUTTON, FIELD];
+            field_y + FIELD
+        }
     };
     let note = [inner_x, form_end + 10.0];
     let footer = [inner_x, note[1] + LINE];
     MenuLayout {
         panel: [x, y, w, h],
-        header: [x, y, w, HEADER],
         tabs,
+        section,
         rows,
         name,
         create,
+        gain_bar,
+        minus,
+        plus,
         note,
         footer,
     }
@@ -279,6 +328,22 @@ fn right_label(
 
 fn dot(host: &dyn Host, batch: &mut HudBatch, at: [f32; 2], size: f32, color: u32) {
     fill(host, batch, [at[0], at[1], size, size], color);
+}
+
+/// A row of `segments` small bars filled up to `level` (0.0 to 1.0).
+fn meter(
+    host: &dyn Host,
+    batch: &mut HudBatch,
+    at: [f32; 2],
+    level: f32,
+    segments: usize,
+    color: u32,
+) {
+    let lit = (level.clamp(0.0, 1.0) * segments as f32).ceil() as usize;
+    for i in 0..segments {
+        let bar = if i < lit { color } else { DOT_OFF };
+        fill(host, batch, [at[0] + i as f32 * 4.0, at[1], 3.0, 5.0], bar);
+    }
 }
 
 /// Shortens `text` with two dots until it fits `max` pixels.
@@ -330,7 +395,25 @@ fn tab(host: &dyn Host, batch: &mut HudBatch, rect: [f32; 4], text: &str, active
     );
 }
 
-/// Draws the group/player menu over a dimmed world.
+fn button(
+    host: &dyn Host,
+    batch: &mut HudBatch,
+    rect: [f32; 4],
+    text: &str,
+    hover: bool,
+) {
+    fill(host, batch, rect, INNER);
+    border(host, batch, rect, if hover { ACCENT } else { ACCENT_DIM });
+    label(
+        host,
+        batch,
+        text,
+        [rect[0] + (rect[2] - host.text_width(text)) * 0.5, rect[1] + 6.0],
+        if hover { TEXT } else { TEXT_MUTED },
+    );
+}
+
+/// Draws the group/player/settings menu over a dimmed world.
 pub fn draw_menu(
     host: &dyn Host,
     batch: &mut HudBatch,
@@ -357,58 +440,105 @@ pub fn draw_menu(
     let tabs = [
         format!("{} ({})", MenuTab::Groups.label(), view.group_count),
         format!("{} ({})", MenuTab::Players.label(), view.player_count),
+        MenuTab::Settings.label().to_owned(),
     ];
     for (i, tab_rect) in layout.tabs.iter().enumerate() {
         let active = view.tab as usize == i;
         tab(host, batch, *tab_rect, &tabs[i], active, inside(*tab_rect, mouse));
     }
 
+    // The title of what the rows are, and the live microphone meter on the settings page.
+    let section = match view.tab {
+        MenuTab::Groups => "Server groups",
+        MenuTab::Players => "Players here",
+        MenuTab::Settings => "Microphone input",
+    };
+    label(host, batch, section, layout.section, TEXT_MUTED);
+    if view.tab == MenuTab::Settings {
+        let meter_x = x + w - PAD - 8.0 * 4.0 + 1.0;
+        meter(host, batch, [meter_x, layout.section[1]], view.level, 8, GREEN);
+    }
+
     // Rows.
     match view.tab {
         MenuTab::Groups => draw_groups(host, batch, view, layout, mouse),
         MenuTab::Players => draw_players(host, batch, view, layout, mouse),
+        MenuTab::Settings => draw_settings(host, batch, view, layout, mouse),
     }
 
-    // The create form and the note/hints.
-    if view.tab == MenuTab::Groups {
-        let field = layout.name;
-        fill(host, batch, field, INNER);
-        border(host, batch, field, ACCENT_DIM);
-        if view.group_name.is_empty() {
-            label(host, batch, "New group name", [field[0] + 6.0, field[1] + 6.0], TEXT_DIM);
-        } else {
-            let text = clip(host, view.group_name, field[2] - 12.0);
-            label(host, batch, &text, [field[0] + 6.0, field[1] + 6.0], TEXT);
-        }
-        if view.caret {
-            let typed = clip(host, view.group_name, field[2] - 14.0);
-            let caret_x = field[0] + 6.0 + host.text_width(&typed).min(field[2] - 14.0);
-            fill(host, batch, [caret_x + 1.0, field[1] + 5.0, 1.0, 10.0], ACCENT);
-        }
-        let enabled = !view.group_name.trim().is_empty();
-        let create = layout.create;
-        fill(host, batch, create, if enabled { ACCENT_DIM } else { INNER });
-        border(host, batch, create, if enabled { ACCENT } else { BORDER });
-        let create_text = "Create group";
-        let color = if enabled { TEXT } else { TEXT_DIM };
-        label(
-            host,
-            batch,
-            create_text,
-            [create[0] + (create[2] - host.text_width(create_text)) * 0.5, create[1] + 6.0],
-            color,
-        );
+    // The create form or the gain control, and the note/hints.
+    match view.tab {
+        MenuTab::Groups => draw_create(host, batch, view, layout),
+        MenuTab::Settings => draw_gain(host, batch, view, layout, mouse),
+        MenuTab::Players => {}
     }
     if let Some(note) = view.note {
         let note = clip(host, note, w - PAD * 2.0);
         label(host, batch, &note, layout.note, AMBER);
     }
     let hint = match view.tab {
-        MenuTab::Groups => "Enter create   Esc close   Tab switches",
-        MenuTab::Players => "Click a player to whisper   Esc close   Tab switches",
+        MenuTab::Groups => "Enter create   Tab next page   Esc close",
+        MenuTab::Players => "Click a player to whisper   Tab next page   Esc close",
+        MenuTab::Settings => "Click a device, -/+ gain   Tab next page   Esc close",
     };
     let hint = clip(host, hint, w - PAD * 2.0);
     label(host, batch, &hint, layout.footer, TEXT_DIM);
+}
+
+fn draw_create(host: &dyn Host, batch: &mut HudBatch, view: &MenuView<'_>, layout: &MenuLayout) {
+    let field = layout.name;
+    fill(host, batch, field, INNER);
+    border(host, batch, field, ACCENT_DIM);
+    if view.group_name.is_empty() {
+        label(host, batch, "New group name", [field[0] + 6.0, field[1] + 6.0], TEXT_DIM);
+    } else {
+        let text = clip(host, view.group_name, field[2] - 12.0);
+        label(host, batch, &text, [field[0] + 6.0, field[1] + 6.0], TEXT);
+    }
+    if view.caret {
+        let typed = clip(host, view.group_name, field[2] - 14.0);
+        let caret_x = field[0] + 6.0 + host.text_width(&typed).min(field[2] - 14.0);
+        fill(host, batch, [caret_x + 1.0, field[1] + 5.0, 1.0, 10.0], ACCENT);
+    }
+    let enabled = !view.group_name.trim().is_empty();
+    let create = layout.create;
+    fill(host, batch, create, if enabled { ACCENT_DIM } else { INNER });
+    border(host, batch, create, if enabled { ACCENT } else { BORDER });
+    let create_text = "Create group";
+    let color = if enabled { TEXT } else { TEXT_DIM };
+    label(
+        host,
+        batch,
+        create_text,
+        [create[0] + (create[2] - host.text_width(create_text)) * 0.5, create[1] + 6.0],
+        color,
+    );
+}
+
+fn draw_gain(
+    host: &dyn Host,
+    batch: &mut HudBatch,
+    view: &MenuView<'_>,
+    layout: &MenuLayout,
+    mouse: [f32; 2],
+) {
+    let bar = layout.gain_bar;
+    fill(host, batch, bar, INNER);
+    border(host, batch, bar, ACCENT_DIM);
+    let fraction = ((view.gain - MIN_GAIN) / (MAX_GAIN - MIN_GAIN)).clamp(0.0, 1.0);
+    let inner = (bar[2] - 4.0).max(0.0) * fraction;
+    fill(host, batch, [bar[0] + 2.0, bar[1] + 2.0, inner, bar[3] - 4.0], ACCENT_WASH);
+    label(host, batch, "Gain", [bar[0] + 6.0, bar[1] + 6.0], TEXT_MUTED);
+    right_label(
+        host,
+        batch,
+        &format!("{}%", (view.gain * 100.0).round() as u32),
+        bar[0] + bar[2] - 6.0,
+        bar[1] + 6.0,
+        TEXT,
+    );
+    button(host, batch, layout.minus, "-", inside(layout.minus, mouse));
+    button(host, batch, layout.plus, "+", inside(layout.plus, mouse));
 }
 
 fn draw_groups(
@@ -424,7 +554,7 @@ fn draw_groups(
             host,
             batch,
             empty,
-            [layout.panel[0] + (layout.panel[2] - host.text_width(empty)) * 0.5, layout.rows.first().map_or(layout.panel[1] + HEADER + TABS, |r| r[1]) + 4.0],
+            [layout.panel[0] + (layout.panel[2] - host.text_width(empty)) * 0.5, layout.section[1] + LINE + 8.0],
             TEXT_DIM,
         );
         return;
@@ -469,7 +599,7 @@ fn draw_players(
             host,
             batch,
             empty,
-            [layout.panel[0] + (layout.panel[2] - host.text_width(empty)) * 0.5, layout.rows.first().map_or(layout.panel[1] + HEADER + TABS, |r| r[1]) + 4.0],
+            [layout.panel[0] + (layout.panel[2] - host.text_width(empty)) * 0.5, layout.section[1] + LINE + 8.0],
             TEXT_DIM,
         );
         return;
@@ -498,6 +628,45 @@ fn draw_players(
         label(host, batch, &name, [row[0] + 17.0, row[1] + 4.0], if player.own { TEXT_DIM } else { TEXT });
         if player.whisper {
             right_label(host, batch, "W", row[0] + row[2] - 8.0, row[1] + 4.0, ACCENT);
+        }
+    }
+}
+
+fn draw_settings(
+    host: &dyn Host,
+    batch: &mut HudBatch,
+    view: &MenuView<'_>,
+    layout: &MenuLayout,
+    mouse: [f32; 2],
+) {
+    for (i, row) in layout.rows.iter().enumerate() {
+        let Some(device) = view.devices.get(i) else { break };
+        let hover = inside(*row, mouse);
+        if device.selected {
+            fill(host, batch, *row, ACCENT_WASH);
+            fill(host, batch, [row[0], row[1], 2.0, row[3]], ACCENT);
+        } else if hover {
+            fill(host, batch, *row, HOVER);
+        }
+        dot(
+            host,
+            batch,
+            [row[0] + 6.0, row[1] + 5.0],
+            6.0,
+            if device.selected { ACCENT } else { DOT_OFF },
+        );
+        let name = clip(host, device.name, row[2] - 76.0);
+        label(
+            host,
+            batch,
+            &name,
+            [row[0] + 17.0, row[1] + 4.0],
+            if device.selected { TEXT } else { TEXT_MUTED },
+        );
+        if device.default {
+            right_label(host, batch, "auto", row[0] + row[2] - 6.0, row[1] + 4.0, TEXT_DIM);
+        } else if device.selected {
+            right_label(host, batch, "on", row[0] + row[2] - 6.0, row[1] + 4.0, AQUA);
         }
     }
 }
@@ -564,19 +733,12 @@ pub fn draw_hud(host: &dyn Host, batch: &mut HudBatch, view: &HudView<'_>, heigh
     // Microphone: label, an eight-segment peak meter and the state.
     label(host, batch, "Mic", [inner_x, cursor], TEXT_MUTED);
     let meter_x = inner_x + 30.0;
-    let lit = if view.mic == MicState::Muted {
-        0
+    let (level, color) = if view.mic == MicState::Muted {
+        (0.0, RED)
     } else {
-        (view.level.clamp(0.0, 1.0) * 8.0).ceil() as usize
+        (view.level, GREEN)
     };
-    for i in 0..8 {
-        let color = if i < lit {
-            if view.mic == MicState::Muted { RED } else { GREEN }
-        } else {
-            DOT_OFF
-        };
-        fill(host, batch, [meter_x + i as f32 * 4.0, cursor + 3.0, 3.0, 5.0], color);
-    }
+    meter(host, batch, [meter_x, cursor + 3.0], level, 8, color);
     let state = clip(host, mic_state, right - (meter_x + METER) - 6.0);
     label(host, batch, &state, [meter_x + METER + 6.0, cursor], view.mic.color());
     cursor += LINE;

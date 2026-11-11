@@ -5,7 +5,7 @@
 //! (960 samples), as in the captures of a Paper server with Simple Voice Chat.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -44,6 +44,10 @@ struct Speaker {
 struct Shared {
     capture: Mutex<VecDeque<f32>>,
     speakers: Mutex<HashMap<[u8; 16], Speaker>>,
+    /// The microphone gain as `f32` bits: written by the game, read by the input callback.
+    gain: AtomicU32,
+    /// Whether an input stream is open right now (it changes when the player picks another).
+    has_input: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -54,27 +58,33 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Playback of other players and capture of the microphone.
 pub struct Audio {
     shared: Arc<Shared>,
+    /// Asks the audio thread to reopen the microphone; `None` is the system default.
+    input_requests: mpsc::Sender<Option<String>>,
     worker: Option<JoinHandle<()>>,
-    has_input: bool,
 }
 
 impl Audio {
-    /// Opens the default output and, when there is one, the default input. Fails only when there
-    /// is no output; without a microphone the player can still listen.
-    pub fn new() -> Result<Audio, String> {
+    /// Opens the default output and, when there is one, an input: the one named in `input`, else
+    /// the default. Fails only when there is no output; without a microphone the player can
+    /// still listen. `gain` multiplies the captured samples.
+    pub fn new(input: Option<&str>, gain: f32) -> Result<Audio, String> {
         let shared = Arc::new(Shared {
             capture: Mutex::new(VecDeque::new()),
             speakers: Mutex::new(HashMap::new()),
+            gain: AtomicU32::new(gain.to_bits()),
+            has_input: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         });
         let (ready_tx, ready_rx) = mpsc::channel::<Result<bool, String>>();
+        let (input_tx, input_rx) = mpsc::channel::<Option<String>>();
         let worker_shared = shared.clone();
+        let initial = input.map(str::to_owned);
         let worker = thread::Builder::new()
             .name("voicechat-audio".into())
-            .spawn(move || run_worker(worker_shared, ready_tx))
+            .spawn(move || run_worker(worker_shared, ready_tx, input_rx, initial))
             .map_err(|e| format!("could not start the audio thread: {e}"))?;
-        let has_input = match ready_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(has_input)) => has_input,
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(_)) => {}
             Ok(Err(e)) => {
                 let _ = worker.join();
                 return Err(e);
@@ -83,12 +93,23 @@ impl Audio {
                 shared.stop.store(true, Ordering::Relaxed);
                 return Err("the audio devices did not answer in 5 seconds".into());
             }
-        };
-        Ok(Audio { shared, worker: Some(worker), has_input })
+        }
+        Ok(Audio { shared, input_requests: input_tx, worker: Some(worker) })
     }
 
     pub fn has_input(&self) -> bool {
-        self.has_input
+        self.shared.has_input.load(Ordering::Relaxed)
+    }
+
+    /// Reopens the microphone on `name`, or on the system default with `None`. Cheap to call
+    /// with the same name: the audio thread ignores a request that changes nothing.
+    pub fn set_input(&self, name: Option<&str>) {
+        let _ = self.input_requests.send(name.map(str::to_owned));
+    }
+
+    /// Sets the microphone gain (a multiplier); the input callback reads it on the next chunk.
+    pub fn set_gain(&self, gain: f32) {
+        self.shared.gain.store(gain.to_bits(), Ordering::Relaxed);
     }
 
     /// The next 20 ms of microphone audio, if a whole frame has been captured.
@@ -198,7 +219,12 @@ impl Mic {
     }
 }
 
-fn run_worker(shared: Arc<Shared>, ready: mpsc::Sender<Result<bool, String>>) {
+fn run_worker(
+    shared: Arc<Shared>,
+    ready: mpsc::Sender<Result<bool, String>>,
+    requests: mpsc::Receiver<Option<String>>,
+    initial: Option<String>,
+) {
     let host = cpal::default_host();
     let output = match host.default_output_device() {
         Some(device) => build_output(&device, shared.clone()),
@@ -211,30 +237,90 @@ fn run_worker(shared: Arc<Shared>, ready: mpsc::Sender<Result<bool, String>>) {
             return;
         }
     };
-    let input = host
-        .default_input_device()
-        .ok_or_else(|| "no microphone found".to_owned())
-        .and_then(|device| build_input(&device, shared.clone()));
-    if let Err(e) = &input {
-        log(&format!("no microphone: {e}"));
-    }
+    let mut current = initial;
+    let mut input = open_and_log(&host, current.as_deref(), &shared);
+    shared.has_input.store(input.is_some(), Ordering::Relaxed);
     if let Err(e) = output.play() {
         let _ = ready.send(Err(format!("could not start playback: {e}")));
         return;
     }
-    let input = input.ok().and_then(|stream| match stream.play() {
-        Ok(()) => Some(stream),
-        Err(e) => {
-            log(&format!("could not start the microphone: {e}"));
-            None
-        }
-    });
     let _ = ready.send(Ok(input.is_some()));
     while !shared.stop.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_millis(50));
+        match requests.recv_timeout(Duration::from_millis(50)) {
+            Ok(requested) => {
+                if requested == current {
+                    continue;
+                }
+                current = requested;
+                // Dropping the stream stops the old microphone before the new one opens.
+                drop(input.take());
+                lock(&shared.capture).clear();
+                input = open_and_log(&host, current.as_deref(), &shared);
+                shared.has_input.store(input.is_some(), Ordering::Relaxed);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
-    drop(input);
+    drop(input.take());
     drop(output);
+}
+
+/// The names of the microphones the system offers, in the order cpal lists them.
+pub fn input_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    match host.input_devices() {
+        Ok(devices) => devices.filter_map(|device| device.name().ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Opens `wanted` (or the default), starts it and says which device it really is.
+fn open_and_log(
+    host: &cpal::Host,
+    wanted: Option<&str>,
+    shared: &Arc<Shared>,
+) -> Option<(Stream, String)> {
+    match open_input(host, wanted, shared.clone()) {
+        Ok(stream) => {
+            log(&format!("microphone: {}", stream.1));
+            Some(stream)
+        }
+        Err(e) => {
+            log(&format!("no microphone: {e}"));
+            None
+        }
+    }
+}
+
+fn open_input(
+    host: &cpal::Host,
+    wanted: Option<&str>,
+    shared: Arc<Shared>,
+) -> Result<(Stream, String), String> {
+    let (device, name) = match wanted.and_then(|name| find_input(host, name)) {
+        Some(device) => (device, wanted.unwrap_or_default().to_owned()),
+        None => {
+            if let Some(name) = wanted {
+                log(&format!("microphone \"{name}\" not found; using the default"));
+            }
+            let device = host
+                .default_input_device()
+                .ok_or_else(|| "no microphone found".to_owned())?;
+            let name = device.name().unwrap_or_else(|_| "system default".to_owned());
+            (device, name)
+        }
+    };
+    let stream = build_input(&device, shared)?;
+    stream
+        .play()
+        .map_err(|e| format!("could not start the microphone: {e}"))?;
+    Ok((stream, name))
+}
+
+fn find_input(host: &cpal::Host, wanted: &str) -> Option<cpal::Device> {
+    let devices = host.input_devices().ok()?;
+    devices.into_iter().find(|device| device.name().ok().as_deref() == Some(wanted))
 }
 
 /// Linear resampling of a stream that arrives in chunks, to 48 kHz.
@@ -327,6 +413,8 @@ fn build_input(device: &cpal::Device, shared: Arc<Shared>) -> Result<Stream, Str
     let mut resampler = Downsampler::new(config.sample_rate.0);
     let mut mono: Vec<f32> = Vec::new();
     let mut handle = move |samples: &[f32]| {
+        // The gain is read once per chunk; the menu writes it while the stream runs.
+        let gain = f32::from_bits(shared.gain.load(Ordering::Relaxed));
         mono.clear();
         mono.extend(
             samples
@@ -334,7 +422,7 @@ fn build_input(device: &cpal::Device, shared: Arc<Shared>) -> Result<Stream, Str
                 .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32),
         );
         let mut capture = lock(&shared.capture);
-        resampler.process(&mono, |s| capture.push_back(s));
+        resampler.process(&mono, |s| capture.push_back((s * gain).clamp(-1.0, 1.0)));
         while capture.len() > MAX_CAPTURE_SAMPLES {
             capture.pop_front();
         }

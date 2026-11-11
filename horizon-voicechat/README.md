@@ -13,8 +13,8 @@ What was checked:
   the real `horizon-client` mod API, `cpal` 0.16 and `rusty-opus` 1.0.2 from Horizon's lock file.
 - The network core (`api/src/net`, copied from `horizon-voicechat-net`): all 30 tests on real
   captured packets pass with the real `ring`.
-- The mod's own 37 unit tests (HUD view, menu tabs and clicks, microphone meter, whisper/deafen
-  state) pass against the real `horizon-client` crate with the launcher's toolchain.
+- The mod's own 45 unit tests (HUD view, menu tabs and clicks, microphone meter, settings page,
+  whisper/deafen state) pass against the real `horizon-client` crate with the launcher's toolchain.
 - The mod has **not** been run against a real Simple Voice Chat server yet, so the handshake and
   audio path are still unverified end to end.
 
@@ -31,8 +31,9 @@ horizon-launcher native-build <this folder> --instance <instance> --trust-native
 Join a server with Simple Voice Chat (the plugin on Paper, or the mod). Watch the game's standard
 error for lines starting with `[voicechat]`: they say when the secret arrives, when the UDP session
 connects and why anything failed. Hold `V` to talk, press `M` to mute, `N` to deafen, `H` to pick
-a whisper target and `G` for the group menu. In the menu, `Tab` switches between Groups and
-Players, and clicking a player makes them the whisper target.
+a whisper target and `G` for the group menu. In the menu, `Tab` cycles through Groups, Players and
+Settings; clicking a player makes them the whisper target, and the Settings page picks the
+microphone and its gain.
 
 On the server side, the UDP port (24454 by default) must be reachable from the client.
 
@@ -54,6 +55,10 @@ On the server side, the UDP port (24454 by default) must be reachable from the c
   creates a group (`create_group`, a captured payload). Only filled rectangles and the game font are
   used; no textures or copied assets.
 - Deafening (`N`) skips playback locally; nothing is sent, so the server never learns about it.
+- A Settings page (`G`, then `Tab`): lists the system's microphones (the default included) and lets
+  you switch without restarting the game, with a live input meter and a 25%–400% gain in 25% steps.
+  The choice and the gain are saved in the mod's data folder
+  (`horizon-mods/.horizon-mod-data/voicechat_client/settings.txt`) and survive reconnects.
 - A whisper target picked with `H` (cycles through the listed players, then off). It is shown in
   the indicator but **not sent**: the whisper packet has never been captured, so voice still goes
   out as ordinary proximity/group voice.
@@ -68,15 +73,18 @@ On the server side, the UDP port (24454 by default) must be reachable from the c
   `remove_category`, `remove_state`) are unverified in the same way.
 - Sending whispers and telling the server you are deafened: both formats are unknown (no capture
   has them). What exists is the local state, the indicator and the deafening itself.
-- Configurable keys and volume.
+- Configurable keys and output volume.
+- Trying the Settings page with real audio hardware: enumeration, switching and gain compile and are
+  unit-tested, but the in-game flow has not been run on real devices yet.
 - Sending the microphone from the game tick means frames leave in small bursts every 50 ms; a worker
   thread that owns the socket would fix that.
 
 ## Layout
 
 - `horizon-mixin.toml`: the bundle. `api/`: the trait mod crate.
-- `api/src/lib.rs`: hooks and session logic. `api/src/audio.rs`: cpal, Opus, mixing.
-  `api/src/ui.rs`: the HUD and menu drawing (panels, tabs, rows, meter). `api/src/util.rs`: small
+- `api/src/lib.rs`: hooks and session logic. `api/src/audio.rs`: cpal, Opus, mixing, microphone
+  switching and gain. `api/src/ui.rs`: the HUD and menu drawing (panels, tabs, rows, meter).
+  `api/src/settings.rs`: the little `settings.txt` (microphone and gain). `api/src/util.rs`: small
   pure helpers. `api/src/net/`: protocol core.
 - `hnmod/`: packaging for the horizon-mods registry (see `hnmod/README.md`).
 - `tools/sync-net.sh`: copies `../horizon-voicechat-net/src` into `api/src/net` (a mod cannot use a path
@@ -90,7 +98,7 @@ A trait mod may only use crates and versions already in Horizon's `Cargo.lock`: 
 ## Packaging as `.hnmod`
 
 `hnmod/package.ps1` builds the tree the horizon-mods registry expects and runs its `native.py
-package`, producing `voicechat-0.1.0.hnmod`: the bundle plus a `horizon-native.json` pinning
+package`, producing `voicechat_client-0.1.0.hnmod`: the bundle plus a `horizon-native.json` pinning
 Horizon `2ebf00a…`, hooks 411, mixins `e8cd0aa…` and game 26.3. It only zips the source; it does
 not compile the mod. See `hnmod/README.md`.
 
@@ -98,6 +106,5 @@ not compile the mod. See `hnmod/README.md`.
 
 Horizon's `CONTRIBUTING.md` and `CLAUDE.md` ask contributors to check open work first. Issue #7759
 was opened by someone building the same thing as a native mod, so coordinate with them before opening
-a PR. A license has to be chosen (Horizon is MIT) and added to the repository root so the `.hnmod`
-carries it; Simple Voice Chat's author should be asked for the protocol spec and whether he wants
-credit.
+a PR. The project is MIT (`LICENSE` at the root, so the `.hnmod` carries it); Simple Voice Chat's
+author should be asked for the protocol spec and whether he wants credit.

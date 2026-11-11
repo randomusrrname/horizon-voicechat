@@ -22,7 +22,7 @@ Fecha: 2026-11-11. Implementación limpia (clean-room) del protocolo de Simple V
 - Commit: `Step 2: on-screen voice indicator with connection, mic and speaker state`.
 
 ### Paso 3 — menú de grupos
-- Pantalla propia del mod (API 111): se abre con `G` (`mod_screen_open("voicechat")`), se dibuja en
+- Pantalla propia del mod (API 111): se abre con `G` (`mod_screen_open("voicechat_client")`), se dibuja en
   `screen_render_post` y toma clic, teclas y texto de los hooks de pantalla.
 - Lista los grupos que anuncia el servidor (`add_group`), marca el grupo propio (`joined_group` y
   `state` del propio UUID) y resalta el grupo del jugador.
@@ -56,6 +56,21 @@ Fecha: 2026-11-11. Implementación limpia (clean-room) del protocolo de Simple V
 - **37/37** tests propios contra el `horizon-client` real.
 - Commit: `a8bd2d8` — `Step 5: Plasmo-style GUI (tabs, rows, live mic meter, player whisper pick)`.
 
+### Paso 6 — menú de configuración del micrófono
+- Tercera pestaña **Settings** en el mismo menú (`G`, luego `Tab`): **Groups → Players → Settings**.
+- Lista los micrófonos del sistema con `cpal` (la primera fila es **System default**, que sigue al
+  predeterminado de Windows) y permite cambiar de dispositivo sin reiniciar el juego: el hilo de
+  audio cierra el stream anterior y abre el nuevo.
+- Ganancia de entrada de **25% a 400%** en pasos de 25%, con barra y botones `-`/`+`; se aplica en
+  la callback de captura (`AtomicU32` con los bits del `f32`) y se recorta a `-1.0..1.0`.
+- Medidor de entrada en vivo también en la página, junto al título de la sección.
+- Se guarda en `horizon-mods/.horizon-mod-data/voicechat_client/settings.txt` (`device=<nombre>` y
+  `gain=1.00`); un archivo ausente o con líneas desconocidas vuelve a los valores por defecto y la
+  ganancia se recorta al rango válido. La elección sobrevive a reconectar.
+- El dispositivo se enumera al abrir el menú y al cambiar a **Settings**, no en cada frame.
+- **45/45** tests propios (8 nuevos: página de ajustes, límites de ganancia, ciclo de pestañas,
+  persistencia al reconectar y formato del archivo).
+
 ## Cómo compilar y probar
 
 ```
@@ -63,31 +78,37 @@ horizon-launcher.exe native-build "C:\Users\Mauro\Documents\Horizon Voicechat\ho
   --instance horizon --version nightly-2026-11-07-2ebf00a --trust-native-code
 ```
 
-Última compilación verificada: `native-2ebf00a-a29fba3121ff`, seleccionada para la instancia
-`horizon` (compilación incremental de 7 min 33 s). Commits: `cd7a480` (paso 1), `c951b37`
-(paso 2), `c4609fc` (paso 3), `86af919` (paso 4).
+Última compilación verificada: `native-2ebf00a-5da74e09c345`, seleccionada para la instancia
+`horizon` (compilación incremental de 8 min 23 s; `native-mods.json` contiene solo
+`voicechat_client`). Commits: `cd7a480` (paso 1), `c951b37` (paso 2), `c4609fc` (paso 3),
+`86af919` (paso 4), `a8bd2d8` (paso 5), más el commit del paso 6.
 
 El `--version nightly-2026-11-07-2ebf00a` es necesario en este entorno: sin él el launcher basa la
 compilación en `c9d474d` en vez del commit fijado.
 
-Teclas: `V` mantener para hablar, `M` mudo, `N` ensordecer, `H` objetivo de susurro, `G` menú de
-grupos; dentro del menú, `Tab` cambia Groups/Players y clic en un jugador lo pone como objetivo de
-susurro. El puerto UDP del servidor (24454 por defecto) debe ser alcanzable.
+Teclas: `V` mantener para hablar, `M` mudo, `N` ensordecer, `H` objetivo de susurro, `G` menú;
+dentro del menú, `Tab` cambia Groups/Players/Settings, clic en un jugador lo pone como objetivo de
+susurro y en **Settings** se elige micrófono y se ajusta la ganancia con `-`/`+`. El puerto UDP del
+servidor (24454 por defecto) debe ser alcanzable.
 
 Tests:
 - `cargo test` en `horizon-voicechat-net` (30 tests).
 - Tests del mod: se ejecutan contra la copia preparada por el launcher en
-  `%APPDATA%\horizon-launcher\native\stage\native-api\voicechat` (37 tests).
+  `%APPDATA%\horizon-launcher\native\stage\native-api\voicechat` (45 tests).
 
 ### Paquete `.hnmod`
+- El registro ya tiene un mod con id `voicechat` (el de Nirokx), así que esta entrada usa
+  **`voicechat_client`** ("Simple Voice Chat Client"); `horizon-mixin.toml`, `hnmod/package.ps1` y
+  la carpeta de datos del mod llevan ese id.
+- Licencia **MIT** en `LICENSE` (titular `randomusrrname`); el empaquetado la incluye.
 - `hnmod/compatibility.json` (juego 26.3, hooks 411, Horizon `2ebf00a…`, mixins `e8cd0aa…`) y
   `hnmod/package.ps1`, que arma el árbol del registro en una carpeta temporal y llama a su
   `native.py package` (solo escribe el zip: no compila ni ejecuta nada).
-- Generado: `voicechat-0.1.0.hnmod`, 39 276 bytes, sha256
-  `e890fccd58f8c863ad886a6d40ae36cb32d211658362ecaa580a905d15990a28`. Contiene
-  `horizon-native.json`, `horizon-mixin.toml` y todo `api/src` (incluido `ui.rs`). Comprobado que sus
-  11 archivos coinciden byte a byte con el árbol de trabajo.
-- Sin `LICENSE` en el proyecto, el zip no lleva licencia: hay que elegirla antes de publicar.
+- Generado: `voicechat_client-0.1.0.hnmod`, 45 844 bytes, sha256
+  `6e3780e95a52f1c17f0c59f9deb81eb54668e5aa472ecfc69580f7385d73b6cd`. Contiene
+  `horizon-native.json`, `horizon-mixin.toml`, todo `api/src` (incluidos `ui.rs` y `settings.rs`) y
+  el `LICENSE` MIT. Comprobado que sus 13 archivos de código/configuración coinciden byte a byte
+  con el árbol de trabajo.
 
 ## No verificado
 
@@ -101,6 +122,8 @@ Tests:
   verificados.
 - `CUSTOM_PAYLOAD_ID = 22` es el id del `CustomPayload` serverbound en `2ebf00a`; `send_payload`
   comprueba que el paquete decodificado sea realmente un `CustomPayload`.
+- La página **Settings** compila y está cubierta por tests, pero el cambio de dispositivo y la
+  ganancia **no se han probado con hardware real dentro del juego**.
 
 ## Pendiente
 
@@ -108,7 +131,7 @@ Tests:
    ensordecido para habilitarlos con formatos verificados.
 2. Audio posicional (posición de los hablantes + mezcla estéreo).
 3. Hilo propio para el socket UDP y el micrófono (hoy los frames salen en ráfagas cada 50 ms).
-4. Teclas y volumen configurables.
+4. Teclas configurables y volumen de salida (el de entrada ya está en Settings).
 5. Elegir licencia (y añadirla a la raíz para que el `.hnmod` la lleve), coordinar con el issue
    #7759 de Horizon y pedir permiso/crédito al autor de Simple Voice Chat antes de publicar.
 6. Publicar en el registro: hace falta que el launcher y `cargo-horizon-mod` de Horizon acepten
